@@ -1,21 +1,228 @@
 import 'package:flutter/material.dart';
 import '../models/models.dart';
 import '../theme.dart';
+import 'package:http/http.dart' as http;
+import '../services/api_client.dart';
+import 'dart:convert';
+import 'package:latlong2/latlong.dart';
 
-class OrderDetailsScreen extends StatelessWidget {
+class OrderDetailsScreen extends StatefulWidget {
   final Order? order;
   const OrderDetailsScreen({super.key, this.order});
 
   @override
+  State<OrderDetailsScreen> createState() => _OrderDetailsScreenState();
+}
+
+class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
+  Order? details;
+  bool loading = false;
+  String? error;
+  double? distanceKm;
+  double? pay;
+  static const double _ratePerKm = 5.0;
+
+  String _clean(String? v) {
+    final s = (v ?? '').toString();
+    final a = s.replaceAll(RegExp(r"<[^>]*>"), '');
+    final b = a
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&quot;', '"');
+    final c = b.replaceAll(RegExp(r"\s+"), ' ').trim();
+    return c;
+  }
+
+  Future<void> fetchDetails() async {
+    if (widget.order == null) return;
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final uri = Uri.parse(ApiEndpoints.orderDetails);
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'order_id': int.tryParse(widget.order!.id) ?? widget.order!.id,
+            }),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        if (data is Map && data['success'] == true) {
+          final o = (data['data'] is Map && data['data']['order'] is Map)
+              ? data['data']['order'] as Map<String, dynamic>
+              : <String, dynamic>{};
+          setState(() {
+            details = Order(
+              id: (o['order_id'] ?? o['id'] ?? widget.order!.id).toString(),
+              customerName: _clean(
+                o['customer_name'] ?? widget.order!.customerName,
+              ),
+              pickupAddress: _clean(
+                o['pickup_address'] ?? widget.order!.pickupAddress,
+              ),
+              deliveryAddress: _clean(
+                o['delivery_address'] ?? widget.order!.deliveryAddress,
+              ),
+              status: _clean(o['status'] ?? widget.order!.status),
+              payout: widget.order!.payout,
+            );
+          });
+          await _computePriceFor(details!);
+        } else {
+          setState(() {
+            error = (data is Map && data['message'] is String)
+                ? _clean(data['message'] as String)
+                : 'Failed to load order';
+          });
+        }
+      } else {
+        setState(() {
+          error = res.body.isNotEmpty
+              ? _clean(res.body)
+              : 'Failed to load order';
+        });
+      }
+    } catch (_) {
+      setState(() {
+        error = 'Network error';
+      });
+    } finally {
+      setState(() {
+        loading = false;
+      });
+    }
+  }
+
+  Future<Map<String, double>?> _geocode(String address) async {
+    if (address.trim().isEmpty) return null;
+    if (DriverSession.mapboxToken.isNotEmpty) {
+      try {
+        final uri = Uri.parse(
+          'https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(address)}.json?limit=1&access_token=${DriverSession.mapboxToken}',
+        );
+        final res = await http.get(uri).timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data is Map &&
+              data['features'] is List &&
+              (data['features'] as List).isNotEmpty) {
+            final first = (data['features'] as List).first as Map;
+            final center = first['center'];
+            if (center is List && center.length >= 2) {
+              final lon = (center[0] as num).toDouble();
+              final lat = (center[1] as num).toDouble();
+              return {'lat': lat, 'lon': lon};
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    try {
+      final uri = Uri.parse('https://nominatim.openstreetmap.org/search')
+          .replace(
+            queryParameters: {'format': 'json', 'limit': '1', 'q': address},
+          );
+      final res = await http
+          .get(
+            uri,
+            headers: {
+              'User-Agent': 'driver-app/1.0',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 12));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        if (data is List && data.isNotEmpty) {
+          final first = data.first as Map<String, dynamic>;
+          final lat = double.tryParse((first['lat'] ?? '').toString());
+          final lon = double.tryParse((first['lon'] ?? '').toString());
+          if (lat != null && lon != null) {
+            return {'lat': lat, 'lon': lon};
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _computePriceFor(Order o) async {
+    try {
+      final from = await _geocode(_clean(o.pickupAddress));
+      final to = await _geocode(_clean(o.deliveryAddress));
+      if (from == null || to == null) return;
+      if (DriverSession.mapboxToken.isNotEmpty) {
+        final uri = Uri.parse(
+          'https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${to!['lon']},${to['lat']};${from!['lon']},${from['lat']}?overview=false&geometries=geojson&access_token=${DriverSession.mapboxToken}',
+        );
+        final res = await http.get(uri).timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data is Map &&
+              data['routes'] is List &&
+              (data['routes'] as List).isNotEmpty) {
+            final route = (data['routes'] as List).first as Map;
+            final distMeters = (route['distance'] as num?)?.toDouble();
+            if (distMeters != null) {
+              final km = distMeters / 1000.0;
+              setState(() {
+                distanceKm = km;
+                pay = km * _ratePerKm;
+              });
+              return;
+            }
+          }
+        }
+      }
+      final d = Distance();
+      final km = d.as(
+        LengthUnit.Kilometer,
+        LatLng(from['lat']!, from['lon']!),
+        LatLng(to['lat']!, to['lon']!),
+      );
+      setState(() {
+        distanceKm = km;
+        pay = km * _ratePerKm;
+      });
+    } catch (_) {}
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    fetchDetails();
+    if (widget.order != null) {
+      _computePriceFor(widget.order!);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final o = order;
+    final o = details ?? widget.order;
     return Scaffold(
       appBar: AppBar(title: const Text('Order Details')),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (loading) const LinearProgressIndicator(),
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Text(
+                  _clean(error!),
+                  style: const TextStyle(color: Colors.redAccent),
+                ),
+              ),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
@@ -32,30 +239,44 @@ class OrderDetailsScreen extends StatelessWidget {
                     const SizedBox(height: 8),
                     Text(
                       o != null
-                          ? 'Customer: ${o.customerName}'
+                          ? 'Customer: ${_clean(o.customerName)}'
                           : 'Select an order from Home',
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      o != null ? 'Pickup: ${o.pickupAddress}' : 'Pickup: -',
+                      o != null
+                          ? 'Pickup: ${_clean(o.pickupAddress)}'
+                          : 'Pickup: -',
                     ),
                     Text(
                       o != null
-                          ? 'Dropoff: ${o.deliveryAddress}'
+                          ? 'Dropoff: ${_clean(o.deliveryAddress)}'
                           : 'Dropoff: -',
                     ),
                     const SizedBox(height: 8),
-                    Text(o != null ? 'Status: ${o.status}' : 'Status: -'),
-                    const SizedBox(height: 8),
                     Text(
-                      'Payout: R ${o != null ? o.payout.toStringAsFixed(2) : '0.00'}',
-                      style: const TextStyle(color: AppTheme.bloodRed),
+                      o != null ? 'Status: ${_clean(o.status)}' : 'Status: -',
+                    ),
+                    const SizedBox(height: 8),
+                    Builder(
+                      builder: (_) {
+                        if (distanceKm == null || pay == null)
+                          return const SizedBox.shrink();
+                        return Text(
+                          'Pay: R ' +
+                              pay!.toStringAsFixed(2) +
+                              ' • ' +
+                              distanceKm!.toStringAsFixed(1) +
+                              ' km',
+                          style: const TextStyle(color: AppTheme.bloodRed),
+                        );
+                      },
                     ),
                   ],
                 ),
               ),
             ),
-            const Spacer(),
+            const SizedBox(height: 16),
             Row(
               children: [
                 Expanded(
@@ -75,10 +296,26 @@ class OrderDetailsScreen extends StatelessWidget {
                   child: ElevatedButton(
                     onPressed: o == null
                         ? null
-                        : () {
+                        : () async {
+                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
-                                content: Text('Marked as delivered'),
+                                content: Text('Updating status...'),
+                              ),
+                            );
+                            final ok = await ApiClient.updateOrderStatus(
+                              o!.id,
+                              'delivered',
+                              action: 'deliver',
+                            );
+                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  ok
+                                      ? 'Marked as delivered'
+                                      : 'Failed to update status',
+                                ),
                               ),
                             );
                           },

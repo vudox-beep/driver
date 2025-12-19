@@ -7,8 +7,16 @@ import 'screens/earnings_screen.dart';
 import 'screens/profile_screen.dart';
 import 'screens/order_details_screen.dart';
 import 'screens/navigation_screen.dart';
+import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
 
 void main() {
+  const String envToken = String.fromEnvironment('ACCESS_TOKEN');
+  if (envToken.isNotEmpty) {
+    DriverSession.mapboxToken = envToken;
+    MapboxOptions.setAccessToken(envToken);
+  } else if ((DriverSession.mapboxToken).isNotEmpty) {
+    MapboxOptions.setAccessToken(DriverSession.mapboxToken);
+  }
   runApp(const MyApp());
 }
 
@@ -56,9 +64,18 @@ class _MyAppState extends State<MyApp> {
           );
         }
         if (settings.name == '/navigate' && settings.arguments != null) {
-          final order = settings.arguments as dynamic;
+          final args = settings.arguments;
+          Order? order;
+          bool autoStart = false;
+          if (args is Map) {
+            order = args['order'] as Order? ?? args['o'] as Order?;
+            autoStart = (args['autoStart'] as bool?) ?? false;
+          } else {
+            order = args as Order?;
+          }
           return MaterialPageRoute(
-            builder: (_) => NavigationScreen(order: order),
+            builder: (_) =>
+                NavigationScreen(order: order, autoStart: autoStart),
           );
         }
         return null;
@@ -78,6 +95,7 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> {
   int index = 0;
   Order? selectedOrder;
+  bool autoStartNav = false;
 
   @override
   Widget build(BuildContext context) {
@@ -85,10 +103,13 @@ class _MainShellState extends State<MainShell> {
       DashboardScreen(
         onSelectOrder: (o) => setState(() => selectedOrder = o),
         goToDetails: () => setState(() => index = 1),
-        goToNavigate: () => setState(() => index = 2),
+        goToNavigate: () => setState(() {
+          autoStartNav = true;
+          index = 2;
+        }),
       ),
       OrderDetailsScreen(order: selectedOrder),
-      NavigationScreen(order: selectedOrder),
+      NavigationScreen(order: selectedOrder, autoStart: autoStartNav),
       const EarningsScreen(),
       ProfileScreen(onLogout: widget.onLogout),
     ];
@@ -98,7 +119,10 @@ class _MainShellState extends State<MainShell> {
         backgroundColor: Colors.black,
         indicatorColor: AppTheme.bloodRed.withOpacity(0.2),
         selectedIndex: index,
-        onDestinationSelected: (i) => setState(() => index = i),
+        onDestinationSelected: (i) => setState(() {
+          index = i;
+          if (i != 2) autoStartNav = false;
+        }),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.home), label: 'Home'),
           NavigationDestination(
