@@ -306,7 +306,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                             final ok = await ApiClient.updateOrderStatus(
                               o!.id,
                               'delivered',
-                              action: 'deliver',
+                              action: 'update_status',
                             );
                             ScaffoldMessenger.of(context).hideCurrentSnackBar();
                             ScaffoldMessenger.of(context).showSnackBar(

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../models/models.dart';
 import '../theme.dart';
+import '../services/api_client.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 
@@ -12,30 +13,26 @@ class EarningsScreen extends StatefulWidget {
 }
 
 class _EarningsScreenState extends State<EarningsScreen> {
-  final history = <DeliveryHistory>[
-    const DeliveryHistory(
-      id: 'ORD-1003',
-      date: '2025-12-12',
-      summary: 'Grocery dropoff',
-      amount: 9.75,
-    ),
-    const DeliveryHistory(
-      id: 'ORD-1004',
-      date: '2025-12-13',
-      summary: 'Pharmacy pickup',
-      amount: 14.20,
-    ),
-    const DeliveryHistory(
-      id: 'ORD-1005',
-      date: '2025-12-14',
-      summary: 'Food delivery',
-      amount: 11.10,
-    ),
-  ];
+  final history = <DeliveryHistory>[]; // delivered earnings history
+  final accepted = <DeliveryHistory>[]; // accepted offers
   bool loading = false;
   String? error;
+  double total = 0.0; // delivered total from API
+  final updating = <String>{};
 
-  double get total => history.fold(0.0, (sum, h) => sum + h.amount);
+  String _s(String? v) {
+    final s = (v ?? '').toString();
+    final a = s.replaceAll(RegExp(r"<[^>]*>"), '');
+    final b = a
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&quot;', '"');
+    final c = b.replaceAll(RegExp(r"\s+"), ' ').trim();
+    return c;
+  }
 
   Future<void> fetchEarnings() async {
     if (currentUser?.driverId == null) return;
@@ -44,51 +41,24 @@ class _EarningsScreenState extends State<EarningsScreen> {
       error = null;
     });
     try {
-      final uri = Uri.parse(ApiEndpoints.earnings);
-      final res = await http
-          .post(
-            uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'driver_id': currentUser!.driverId}),
-          )
-          .timeout(const Duration(seconds: 12));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data is Map && data['success'] == true) {
-          final list = (data['data'] is Map && data['data']['history'] is List)
-              ? List<Map<String, dynamic>>.from(data['data']['history'])
-              : <Map<String, dynamic>>[];
-          final parsed = list
-              .map(
-                (e) => DeliveryHistory(
-                  id: (e['id'] ?? e['order_id'] ?? '').toString(),
-                  date: (e['date'] ?? e['created_at'] ?? '').toString(),
-                  summary: (e['summary'] ?? e['description'] ?? '').toString(),
-                  amount:
-                      double.tryParse(
-                        (e['amount'] ?? e['payout'] ?? '0').toString(),
-                      ) ??
-                      0.0,
-                ),
-              )
-              .toList();
-          setState(() {
-            if (parsed.isNotEmpty) {
-              history
-                ..clear()
-                ..addAll(parsed);
-            }
-          });
-        } else {
-          setState(() {
-            error = (data is Map && data['message'] is String)
-                ? data['message']
-                : 'Failed to load earnings';
-          });
-        }
+      final r = await ApiClient.fetchDriverAssignmentsAndStats(
+        currentUser!.driverId!,
+      );
+      if (r != null) {
+        setState(() {
+          total = (r['total'] as double?) ?? 0.0;
+          final acc = (r['accepted'] as List<DeliveryHistory>?);
+          final del = (r['delivered'] as List<DeliveryHistory>?);
+          accepted
+            ..clear()
+            ..addAll(acc ?? const []);
+          history
+            ..clear()
+            ..addAll(del ?? const []);
+        });
       } else {
         setState(() {
-          error = res.body.isNotEmpty ? res.body : 'Failed to load earnings';
+          error = 'Failed to load earnings';
         });
       }
     } catch (_) {
@@ -111,7 +81,7 @@ class _EarningsScreenState extends State<EarningsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Earnings & History')),
+      appBar: AppBar(title: const Text('Earnings')),
       body: Column(
         children: [
           if (loading)
@@ -135,7 +105,7 @@ class _EarningsScreenState extends State<EarningsScreen> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('Total'),
+                    const Text('Total Earnings'),
                     Text(
                       'R ${total.toStringAsFixed(2)}',
                       style: const TextStyle(
@@ -150,39 +120,141 @@ class _EarningsScreenState extends State<EarningsScreen> {
             ),
           ),
           Expanded(
-            child: ListView.separated(
-              itemCount: history.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 8),
+            child: ListView(
               padding: const EdgeInsets.all(16),
-              itemBuilder: (context, index) {
-                final item = history[index];
-                return Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Column(
+              children: [
+                if (accepted.isNotEmpty) ...[
+                  const Text(
+                    'Accepted Offers',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  ...accepted.map(
+                    (item) => Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(
-                              item.id,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                              ),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        (item.customerName ?? '').isNotEmpty
+                                            ? item.customerName!
+                                            : item.id,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      if ((item.address ?? '').isNotEmpty)
+                                        Text(item.address!),
+                                      const SizedBox(height: 4),
+                                      Text(item.date),
+                                    ],
+                                  ),
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Text('R ${item.amount.toStringAsFixed(2)}'),
+                                    const SizedBox(height: 8),
+                                    SizedBox(
+                                      width: 120,
+                                      child: ElevatedButton(
+                                        onPressed: updating.contains(item.id)
+                                            ? null
+                                            : () async {
+                                                setState(() {
+                                                  updating.add(item.id);
+                                                });
+                                                final ok =
+                                                    await ApiClient.updateOrderStatus(
+                                                      item.id,
+                                                      'delivered',
+                                                      action: 'update_status',
+                                                    );
+                                                if (ok) {
+                                                  await fetchEarnings();
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    const SnackBar(
+                                                      content: Text(
+                                                        'Earnings updated',
+                                                      ),
+                                                    ),
+                                                  );
+                                                } else {
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        'Failed: ${ApiClient.lastError ?? 'update failed'}',
+                                                      ),
+                                                    ),
+                                                  );
+                                                }
+                                                setState(() {
+                                                  updating.remove(item.id);
+                                                });
+                                              },
+                                        child: const Text('Deliver'),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
                             ),
-                            const SizedBox(height: 4),
-                            Text(item.summary),
-                            const SizedBox(height: 4),
-                            Text(item.date),
                           ],
                         ),
-                        Text('R ${item.amount.toStringAsFixed(2)}'),
-                      ],
+                      ),
                     ),
                   ),
-                );
-              },
+                  const SizedBox(height: 16),
+                ],
+                const Text(
+                  'Earnings History',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                if (history.isEmpty) const Text('No delivered orders yet'),
+                ...history.map(
+                  (item) => Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                item.id,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(item.summary),
+                              const SizedBox(height: 4),
+                              Text(item.date),
+                            ],
+                          ),
+                          Text('R ${item.amount.toStringAsFixed(2)}'),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],

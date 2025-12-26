@@ -78,6 +78,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         desiredAccuracy: LocationAccuracy.high,
       );
       _driverCoord = LatLng(pos.latitude, pos.longitude);
+      await _pushLocationUpdate(pos);
     } catch (_) {}
   }
 
@@ -173,8 +174,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ).listen((pos) {
             _driverCoord = LatLng(pos.latitude, pos.longitude);
+            _pushLocationUpdate(pos);
             _recomputeDistances();
           });
+    } catch (_) {}
+  }
+
+  Future<bool> _openExternalDirections(Order order) async {
+    final origin = _driverCoord;
+    final destAddr = order.deliveryAddress;
+    final destLat = order.dealerLat;
+    final destLng = order.dealerLng;
+    Uri? uri;
+    if (origin != null) {
+      final o = '${origin.latitude},${origin.longitude}';
+      if ((destAddr ?? '').trim().isNotEmpty) {
+        final d = Uri.encodeComponent(destAddr!);
+        uri = Uri.parse(
+          'https://www.google.com/maps/dir/?api=1&origin=$o&destination=$d&travelmode=driving',
+        );
+      } else if (destLat != null && destLng != null) {
+        final d = '${destLat},${destLng}';
+        uri = Uri.parse(
+          'https://www.google.com/maps/dir/?api=1&origin=$o&destination=$d&travelmode=driving',
+        );
+      }
+    } else if ((destAddr ?? '').trim().isNotEmpty) {
+      final d = Uri.encodeComponent(destAddr!);
+      uri = Uri.parse('https://www.google.com/maps/search/?api=1&query=$d');
+    }
+    if (uri == null) return false;
+    try {
+      return await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _pushLocationUpdate(Position pos) async {
+    if (currentUser?.driverId == null) return;
+    try {
+      await ApiClient.updateDriverLocation(pos.latitude, pos.longitude);
     } catch (_) {}
   }
 
@@ -245,7 +285,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       Text(available ? 'Available' : 'Offline'),
                       const SizedBox(width: 6),
                       IconButton(
-                        onPressed: () => setState(() => available = !available),
+                        onPressed: () async {
+                          setState(() => available = !available);
+                          try {
+                            await ApiClient.updateDriverAvailability(available);
+                          } catch (_) {}
+                        },
                         icon: Icon(
                           available ? Icons.toggle_on : Icons.toggle_off,
                         ),
@@ -550,17 +595,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                         content: Text('Accepting order...'),
                                       ),
                                     );
-                                    final ok = await ApiClient.acceptOrder(
-                                      order.id,
-                                    );
+                                    bool okAccept = false;
+                                    try {
+                                      okAccept = await ApiClient.acceptOrder(
+                                        order.id,
+                                        proposedFee: pay,
+                                        pickupTime: DateTime.now(),
+                                      );
+                                    } catch (_) {}
                                     ScaffoldMessenger.of(
                                       context,
                                     ).hideCurrentSnackBar();
-                                    if (ok) {
-                                      if (widget.onSelectOrder != null) {
-                                        widget.onSelectOrder!(order);
-                                        widget.goToNavigate?.call();
-                                      } else {
+                                    if (!okAccept) {
+                                      final err =
+                                          ApiClient.lastError ??
+                                          'Failed to accept order';
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        SnackBar(content: Text(err)),
+                                      );
+                                      return;
+                                    }
+                                    // Start navigation immediately without waiting for assignment polling
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('Starting navigation...'),
+                                      ),
+                                    );
+                                    if (widget.onSelectOrder != null) {
+                                      widget.onSelectOrder!(order);
+                                      widget.goToNavigate?.call();
+                                    } else {
+                                      final usedExternal =
+                                          DriverSession.mapboxToken.isEmpty
+                                          ? await _openExternalDirections(order)
+                                          : false;
+                                      if (!usedExternal) {
                                         Navigator.pushNamed(
                                           context,
                                           '/navigate',
@@ -570,23 +641,34 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                           },
                                         );
                                       }
-                                    } else {
-                                      final noAuth =
-                                          (DriverSession.authToken ?? '')
-                                              .isEmpty &&
-                                          (currentUser?.driverId == null);
-                                      final msg = noAuth
-                                          ? 'Please log in as driver to accept orders'
-                                          : (ApiClient.lastError?.isNotEmpty ==
-                                                    true
-                                                ? ApiClient.lastError!
-                                                : 'Failed to accept order');
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        SnackBar(content: Text(msg)),
-                                      );
                                     }
+                                    try {
+                                      final okStatus =
+                                          await ApiClient.updateOrderStatus(
+                                            order.id,
+                                            'picked_up',
+                                            action: 'update_status',
+                                            extra: {
+                                              'driver_pickup_time':
+                                                  ApiClient.nowTs(),
+                                              'driver_assigned_at':
+                                                  ApiClient.nowTs(),
+                                              if (pay != null) 'fee': pay,
+                                              if (pay != null)
+                                                'delivery_fee': pay,
+                                            },
+                                          );
+                                      if (!okStatus) {
+                                        final err =
+                                            ApiClient.lastError ??
+                                            'Failed to update status';
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).showSnackBar(
+                                          SnackBar(content: Text(err)),
+                                        );
+                                      }
+                                    } catch (_) {}
                                   },
                                   child: const Text('Accept'),
                                 ),

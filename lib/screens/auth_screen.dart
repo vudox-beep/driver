@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 import '../theme.dart';
 import '../models/models.dart';
 import '../services/api_client.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:geolocator/geolocator.dart';
 
 class AuthScreen extends StatefulWidget {
   final VoidCallback onAuthenticated;
@@ -25,12 +27,73 @@ class _AuthScreenState extends State<AuthScreen> {
   final vehicleTypeController = TextEditingController();
   final vehiclePlateController = TextEditingController();
   final licenseNumberController = TextEditingController();
+  final locationController = TextEditingController();
+  final latController = TextEditingController();
+  final lngController = TextEditingController();
   bool agreedMarketing = false;
-  bool isLogin = true;
+  bool isLogin = false;
   bool isSubmitting = false;
   String? noticeMessage;
   bool noticeIsError = true;
   String get apiBaseUrl => DriverSession.apiBaseUrl;
+  XFile? profilePhoto;
+  double? latitude;
+  double? longitude;
+  bool locating = false;
+
+  Future<void> pickPhoto() async {
+    final picker = ImagePicker();
+    try {
+      final x = await picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 1,
+        maxWidth: 800,
+        maxHeight: 800,
+      );
+      if (x != null) {
+        setState(() => profilePhoto = x);
+      }
+    } catch (e) {
+      setState(() {
+        noticeMessage = e.toString();
+        noticeIsError = true;
+      });
+    }
+  }
+
+  Future<void> getLocation() async {
+    if (locating) return;
+    setState(() => locating = true);
+    try {
+      LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        throw Exception('Location permission denied');
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.best,
+      );
+      setState(() {
+        latitude = pos.latitude;
+        longitude = pos.longitude;
+        locationController.text =
+            pos.latitude.toString() + ',' + pos.longitude.toString();
+        latController.text = pos.latitude.toString();
+        lngController.text = pos.longitude.toString();
+      });
+    } catch (e) {
+      setState(() {
+        noticeMessage = e.toString();
+        noticeIsError = true;
+      });
+    } finally {
+      setState(() => locating = false);
+    }
+  }
 
   Future<void> submit() async {
     if (isSubmitting) return;
@@ -43,7 +106,8 @@ class _AuthScreenState extends State<AuthScreen> {
         );
         if (u != null) {
           if ((u.driverStatus ?? '').toLowerCase() == 'inactive') {
-            final msg = 'Driver registered successfully. Awaiting admin approval. Check your email.';
+            final msg =
+                'Driver registered successfully. Awaiting admin approval. Check your email.';
             setState(() {
               noticeMessage = msg;
               noticeIsError = false;
@@ -61,7 +125,16 @@ class _AuthScreenState extends State<AuthScreen> {
           });
         }
       } else {
-        final resp = await ApiClient.signup({
+        if (latitude == null || longitude == null) {
+          try {
+            final pos = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.best,
+            );
+            latitude = pos.latitude;
+            longitude = pos.longitude;
+          } catch (_) {}
+        }
+        final payload = {
           'username': usernameController.text.trim(),
           'email': emailController.text.trim(),
           'password': passwordController.text,
@@ -73,10 +146,17 @@ class _AuthScreenState extends State<AuthScreen> {
           'vehicle_plate': vehiclePlateController.text.trim(),
           'license_number': licenseNumberController.text.trim(),
           'agreed_marketing': agreedMarketing ? 1 : 0,
-        });
+          if (latitude != null) 'latitude': latitude,
+          if (longitude != null) 'longitude': longitude,
+        };
+        final resp = await ApiClient.signupMultipart(
+          payload,
+          profilePhoto?.path,
+        );
         if (resp != null) {
           final success = resp['success'] == true;
-          final message = (resp['message'] ?? resp['error'] ?? '')?.toString() ?? '';
+          final message =
+              (resp['message'] ?? resp['error'] ?? '')?.toString() ?? '';
           if (!success) {
             if (message.isNotEmpty) {
               setState(() {
@@ -110,11 +190,17 @@ class _AuthScreenState extends State<AuthScreen> {
   @override
   void initState() {
     super.initState();
+    if (!isLogin) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        getLocation();
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(title: Text(isLogin ? 'Login' : 'Sign Up')),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -124,18 +210,32 @@ class _AuthScreenState extends State<AuthScreen> {
               children: [
                 const SizedBox(height: 40),
                 Text(
-                  isLogin ? 'Driver Login' : 'Create Driver Account',
+                  isLogin ? 'Driver Login' : 'Driver Sign Up',
                   style: const TextStyle(
                     fontSize: 28,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
                 const SizedBox(height: 24),
-                if (!isLogin)
-                  TextField(
-                    controller: usernameController,
-                    decoration: const InputDecoration(labelText: 'Username'),
-                  ),
+                Row(
+                  children: [
+                    ChoiceChip(
+                      label: const Text('Login'),
+                      selected: isLogin,
+                      onSelected: (_) => setState(() => isLogin = true),
+                    ),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      label: const Text('Sign Up'),
+                      selected: !isLogin,
+                      onSelected: (_) {
+                        setState(() => isLogin = false);
+                        getLocation();
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
                 const SizedBox(height: 12),
                 if (noticeMessage != null) ...[
                   Container(
@@ -146,8 +246,7 @@ class _AuthScreenState extends State<AuthScreen> {
                           ? Colors.red.withOpacity(0.08)
                           : Colors.green.withOpacity(0.08),
                       border: Border.all(
-                        color:
-                            noticeIsError ? Colors.redAccent : Colors.green,
+                        color: noticeIsError ? Colors.redAccent : Colors.green,
                       ),
                       borderRadius: BorderRadius.circular(8),
                     ),
@@ -158,8 +257,9 @@ class _AuthScreenState extends State<AuthScreen> {
                           noticeIsError
                               ? Icons.error_outline
                               : Icons.check_circle_outline,
-                          color:
-                              noticeIsError ? Colors.redAccent : Colors.green,
+                          color: noticeIsError
+                              ? Colors.redAccent
+                              : Colors.green,
                         ),
                         const SizedBox(width: 8),
                         Expanded(
@@ -177,68 +277,184 @@ class _AuthScreenState extends State<AuthScreen> {
                         IconButton(
                           onPressed: () => setState(() => noticeMessage = null),
                           icon: const Icon(Icons.close),
-                          color:
-                              noticeIsError ? Colors.redAccent : Colors.green,
+                          color: noticeIsError
+                              ? Colors.redAccent
+                              : Colors.green,
                         ),
                       ],
                     ),
                   ),
                   const SizedBox(height: 12),
                 ],
-                TextField(
-                  controller: emailController,
-                  decoration: InputDecoration(
-                    labelText: isLogin ? 'Email or Username' : 'Email',
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      children: [
+                        TextField(
+                          controller: emailController,
+                          decoration: InputDecoration(
+                            labelText: isLogin ? 'Email or Username' : 'Email',
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: passwordController,
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Password',
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: passwordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Password'),
                 ),
                 if (!isLogin) ...[
                   const SizedBox(height: 12),
-                  TextField(
-                    controller: firstNameController,
-                    decoration: const InputDecoration(labelText: 'First Name'),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(0, 40),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: locating ? null : getLocation,
+                        child: Text(
+                          locating ? 'Locating...' : 'Use Current Location',
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      if (latitude != null && longitude != null)
+                        Row(
+                          children: const [
+                            Icon(Icons.check_circle, color: Colors.green),
+                            SizedBox(width: 6),
+                            Text(
+                              'Location detected',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ],
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 12),
-                  TextField(
-                    controller: lastNameController,
-                    decoration: const InputDecoration(labelText: 'Last Name'),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: phoneController,
-                    decoration: const InputDecoration(labelText: 'Phone'),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: dobController,
-                    decoration: const InputDecoration(
-                      labelText: 'Date of Birth (YYYY-MM-DD)',
+
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final isWide = constraints.maxWidth >= 600;
+                          final itemWidth = isWide
+                              ? (constraints.maxWidth - 12) / 2
+                              : constraints.maxWidth;
+                          return Wrap(
+                            spacing: 12,
+                            runSpacing: 12,
+                            children: [
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: usernameController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Username',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: firstNameController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'First Name',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: lastNameController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Last Name',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: phoneController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Phone',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: dobController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Date of Birth (YYYY-MM-DD)',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
                     ),
                   ),
                   const SizedBox(height: 12),
-                  TextField(
-                    controller: vehicleTypeController,
-                    decoration: const InputDecoration(
-                      labelText: 'Vehicle Type',
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: vehiclePlateController,
-                    decoration: const InputDecoration(
-                      labelText: 'Vehicle Plate',
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: licenseNumberController,
-                    decoration: const InputDecoration(
-                      labelText: 'License Number',
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final isWide = constraints.maxWidth >= 600;
+                          final itemWidth = isWide
+                              ? (constraints.maxWidth - 12) / 2
+                              : constraints.maxWidth;
+                          return Wrap(
+                            spacing: 12,
+                            runSpacing: 12,
+                            children: [
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: vehicleTypeController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Vehicle Type',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: vehiclePlateController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Vehicle Plate',
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: itemWidth,
+                                child: TextField(
+                                  controller: licenseNumberController,
+                                  decoration: const InputDecoration(
+                                    labelText: 'License Number',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -253,18 +469,72 @@ class _AuthScreenState extends State<AuthScreen> {
                       const Text('Agree to marketing'),
                     ],
                   ),
+                  const SizedBox(height: 12),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      child: Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 20,
+                            backgroundColor: Colors.grey.shade800,
+                            child: const Icon(
+                              Icons.image,
+                              color: Colors.white70,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Profile Photo'),
+                                const SizedBox(height: 4),
+                                Text(
+                                  profilePhoto?.name ?? 'No file selected',
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: pickPhoto,
+                            icon: const Icon(Icons.upload_file),
+                            label: const Text('Browse'),
+                          ),
+                          const SizedBox(width: 8),
+                          if (profilePhoto != null)
+                            TextButton(
+                              onPressed: () =>
+                                  setState(() => profilePhoto = null),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.redAccent,
+                              ),
+                              child: const Text('Clear'),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
                 const SizedBox(height: 24),
                 ElevatedButton(
                   onPressed: isSubmitting ? null : submit,
-                  child: Text(isLogin ? 'Sign In' : 'Register'),
+                  child: Text(isLogin ? 'Sign In' : 'Sign Up'),
                 ),
                 const SizedBox(height: 12),
                 TextButton(
                   onPressed: () => setState(() => isLogin = !isLogin),
                   child: Text(
                     isLogin
-                        ? 'No account? Register'
+                        ? 'No account? Sign Up'
                         : 'Have an account? Sign In',
                     style: const TextStyle(color: AppTheme.bloodRed),
                   ),

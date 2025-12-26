@@ -27,12 +27,16 @@ class DeliveryHistory {
   final String date;
   final String summary;
   final double amount;
+  final String? customerName;
+  final String? address;
 
   const DeliveryHistory({
     required this.id,
     required this.date,
     required this.summary,
     required this.amount,
+    this.customerName,
+    this.address,
   });
 }
 
@@ -105,7 +109,7 @@ String apiBase(String file) => 'https://' + apiHost + '/drivers/' + file;
 class ApiEndpoints {
   static String get base => 'https://' + apiHost + '/drivers/';
   static String get drivers => base + 'driver_api.php';
-  static String get driverOrders => base + 'driver_orders.php';
+  static String get driverOrders => base + 'orders_api.php';
   static String get driverAvailable => base + 'driver_available_orders.php';
   static String get orders => base + 'orders_api.php';
   static String get ordersPage => base + 'orders.php';

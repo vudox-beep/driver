@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import '../models/models.dart';
 import '../theme.dart';
+import '../services/api_client.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:flutter_map/flutter_map.dart' as fmap;
@@ -9,6 +10,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:geolocator/geolocator.dart';
+import 'dart:math' as math;
 
 class _PointClick implements mapbox.OnPointAnnotationClickListener {
   final void Function(mapbox.PointAnnotation) onClick;
@@ -49,6 +51,21 @@ class _NavigationScreenState extends State<NavigationScreen> {
   StreamSubscription<Position>? _posSub;
   bool navToPickup = false;
   final Distance _distCalc = const Distance();
+  Timer? _simTimer;
+  bool showInfoOverlay = false;
+  bool _didInitialFit = false;
+  List<_NavStep> _steps = const [];
+  int _stepIndex = 0;
+  String? _stepName;
+  double? _stepDistMeters;
+  String? _stepType;
+  String? _stepModifier;
+  List<LatLng> _stepGeom = const [];
+  double _kmToMiles(double km) => km * 0.621371;
+  double? _speedKmh;
+  LatLng? _lastSpeedCoord;
+  DateTime? _lastSpeedTime;
+  double _currentZoom = 15.0;
 
   void _onPointAnnotationTap(mapbox.PointAnnotation ann) {
     final o = widget.order;
@@ -94,6 +111,55 @@ class _NavigationScreenState extends State<NavigationScreen> {
         );
       },
     );
+  }
+
+  IconData _turnIconFor(String? type, String? modifier) {
+    final t = (type ?? '').toLowerCase();
+    final m = (modifier ?? '').toLowerCase();
+    if (t == 'turn') {
+      if (m.contains('left')) return Icons.keyboard_arrow_left;
+      if (m.contains('right')) return Icons.keyboard_arrow_right;
+      return Icons.navigation;
+    }
+    if (t == 'depart' || t == 'continue') return Icons.arrow_upward;
+    if (t == 'arrive') return Icons.flag;
+    if (t == 'uturn') return Icons.keyboard_return;
+    if (t == 'roundabout') return Icons.sync;
+    return Icons.navigation;
+  }
+
+  double? _nextTurnDistanceMiles() {
+    if (userCoord != null && _stepGeom.isNotEmpty) {
+      final end = _stepGeom.last;
+      final km = _distCalc.as(LengthUnit.Kilometer, userCoord!, end);
+      return _kmToMiles(km);
+    }
+    if (_stepDistMeters != null) return _stepDistMeters! / 1609.34;
+    return routeDistanceKm != null ? _kmToMiles(routeDistanceKm!) : null;
+  }
+
+  void _updateCurrentStep() {
+    if (userCoord == null || _steps.isEmpty) return;
+    final s = _steps[_stepIndex];
+    if (s.geom.isNotEmpty) {
+      final end = s.geom.last;
+      final d = _distCalc.as(LengthUnit.Meter, userCoord!, end);
+      if (d < 30 && _stepIndex < _steps.length - 1) {
+        final ns = _steps[_stepIndex + 1];
+        setState(() {
+          _stepIndex = _stepIndex + 1;
+          _stepName = ns.name;
+          _stepDistMeters = ns.distance;
+          _stepType = ns.type;
+          _stepModifier = ns.modifier;
+          _stepGeom = ns.geom;
+        });
+      } else {
+        setState(() {
+          _stepDistMeters = d;
+        });
+      }
+    }
   }
 
   String _clean(String? v) {
@@ -208,6 +274,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
       if (userCoord != null) {
         navToPickup = from != null;
         await _recalcRouteFromUser();
+        if (routeFare != null) {
+          await ApiClient.updateOrderStatus(
+            o.id,
+            'picked_up',
+            action: 'update_status',
+            extra: {
+              'driver_pickup_time': ApiClient.nowTs(),
+              'fee': routeFare,
+              'delivery_fee': routeFare,
+            },
+          );
+        }
+        if (mounted) setState(() => showInfoOverlay = true);
       } else {
         if (from != null && to != null) {
           final ok = await _fetchRoute(from, to);
@@ -216,6 +295,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
               const SnackBar(content: Text('Unable to get directions')),
             );
           }
+          if (routeFare != null) {
+            await ApiClient.updateOrderStatus(
+              o.id,
+              'picked_up',
+              action: 'update_status',
+              extra: {
+                'driver_pickup_time': ApiClient.nowTs(),
+                'fee': routeFare,
+                'delivery_fee': routeFare,
+              },
+            );
+          }
+          if (mounted) setState(() => showInfoOverlay = true);
         } else {
           await _syncMapboxAnnotations();
         }
@@ -228,6 +320,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
     });
     if (from != null && to != null) {
       await _fetchRoute(from, to);
+      if (routeFare != null && o != null) {
+        await ApiClient.updateOrderStatus(
+          o.id,
+          'picked_up',
+          action: 'update_status',
+          extra: {
+            'driver_pickup_time': ApiClient.nowTs(),
+            'fee': routeFare,
+            'delivery_fee': routeFare,
+          },
+        );
+      }
+      if (mounted) setState(() => showInfoOverlay = true);
     } else {
       await _syncMapboxAnnotations();
     }
@@ -266,41 +371,146 @@ class _NavigationScreenState extends State<NavigationScreen> {
   }
 
   Future<bool> _fetchRoute(LatLng from, LatLng to) async {
+    final hasToken = DriverSession.mapboxToken.isNotEmpty;
     try {
-      final url = Uri.parse(
-        'https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?geometries=polyline6&overview=full&access_token=${DriverSession.mapboxToken}',
-      );
-      final res = await http.get(url).timeout(const Duration(seconds: 12));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data is Map &&
-            data['routes'] is List &&
-            (data['routes'] as List).isNotEmpty) {
-          final route = (data['routes'] as List).first as Map;
-          final geometry = (route['geometry'] ?? '').toString();
-          final pts = _decodePolyline6(geometry);
-          if (pts.isNotEmpty) {
-            setState(() {
-              routePoints = pts;
-              final distMeters = (route['distance'] as num?)?.toDouble();
-              if (distMeters != null) {
-                routeDistanceKm = distMeters / 1000.0;
-                routeFare = routeDistanceKm! * _ratePerKm;
-              } else {
-                routeDistanceKm = null;
-                routeFare = null;
+      if (hasToken) {
+        final url = Uri.parse(
+          'https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?geometries=polyline6&steps=true&overview=full&access_token=${DriverSession.mapboxToken}',
+        );
+        final res = await http.get(url).timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data is Map &&
+              data['routes'] is List &&
+              (data['routes'] as List).isNotEmpty) {
+            final route = (data['routes'] as List).first as Map;
+            final geometry = (route['geometry'] ?? '').toString();
+            final pts = _decodePolyline6(geometry);
+            if (pts.isNotEmpty) {
+              setState(() {
+                routePoints = pts;
+                final distMeters = (route['distance'] as num?)?.toDouble();
+                if (distMeters != null) {
+                  routeDistanceKm = distMeters / 1000.0;
+                  routeFare = routeDistanceKm! * _ratePerKm;
+                } else {
+                  routeDistanceKm = null;
+                  routeFare = null;
+                }
+                final legs = route['legs'];
+                if (legs is List && legs.isNotEmpty) {
+                  final leg = legs.first as Map;
+                  final st = leg['steps'];
+                  final built = <_NavStep>[];
+                  if (st is List && st.isNotEmpty) {
+                    for (final e in st) {
+                      if (e is Map) {
+                        final name = (e['name'] ?? '').toString();
+                        final dm = (e['distance'] as num?)?.toDouble() ?? 0.0;
+                        final man = e['maneuver'] as Map?;
+                        final type = (man?['type'] ?? '').toString();
+                        final mod = (man?['modifier'] ?? '').toString();
+                        final gstr = (e['geometry'] ?? '').toString();
+                        final g = gstr.isNotEmpty
+                            ? _decodePolyline6(gstr)
+                            : const <LatLng>[];
+                        built.add(_NavStep(name, dm, type, mod, g));
+                      }
+                    }
+                  }
+                  _steps = built;
+                  _stepIndex = 0;
+                  if (_steps.isNotEmpty) {
+                    final s = _steps.first;
+                    _stepName = s.name;
+                    _stepDistMeters = s.distance;
+                    _stepType = s.type;
+                    _stepModifier = s.modifier;
+                    _stepGeom = s.geom;
+                  } else {
+                    _stepName = null;
+                    _stepDistMeters = null;
+                    _stepType = null;
+                    _stepModifier = null;
+                    _stepGeom = const [];
+                  }
+                }
+              });
+              if (_mapbox != null) {
+                await _syncMapboxAnnotations();
+                await _fitCameraToTargetsIfNeeded();
               }
-            });
-            if (_mapbox != null) {
-              await _syncMapboxAnnotations();
-              await _fitCameraToTargets();
+              if (userCoord == null && _simTimer == null) {
+                int i = 0;
+                _simTimer = Timer.periodic(const Duration(milliseconds: 700), (
+                  t,
+                ) async {
+                  if (i >= routePoints.length) {
+                    t.cancel();
+                    _simTimer = null;
+                    return;
+                  }
+                  setState(() {
+                    userCoord = routePoints[i];
+                  });
+                  i++;
+                  await _syncMapboxAnnotations();
+                  _updateCurrentStep();
+                });
+              }
+              return true;
             }
-            return true;
+          }
+        }
+      } else {
+        final url = Uri.parse(
+          'https://router.project-osrm.org/route/v1/driving/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?overview=full&geometries=polyline6',
+        );
+        final res = await http.get(url).timeout(const Duration(seconds: 15));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data is Map &&
+              data['routes'] is List &&
+              (data['routes'] as List).isNotEmpty) {
+            final route = (data['routes'] as List).first as Map;
+            final geometry = (route['geometry'] ?? '').toString();
+            final pts = _decodePolyline6(geometry);
+            if (pts.isNotEmpty) {
+              setState(() {
+                routePoints = pts;
+                final distMeters = (route['distance'] as num?)?.toDouble();
+                if (distMeters != null) {
+                  routeDistanceKm = distMeters / 1000.0;
+                  routeFare = routeDistanceKm! * _ratePerKm;
+                } else {
+                  routeDistanceKm = null;
+                  routeFare = null;
+                }
+              });
+              await _syncMapboxAnnotations();
+              await _fitCameraToTargetsIfNeeded();
+              if (userCoord == null && _simTimer == null) {
+                int i = 0;
+                _simTimer = Timer.periodic(const Duration(milliseconds: 700), (
+                  t,
+                ) async {
+                  if (i >= routePoints.length) {
+                    t.cancel();
+                    _simTimer = null;
+                    return;
+                  }
+                  setState(() {
+                    userCoord = routePoints[i];
+                  });
+                  i++;
+                });
+              }
+              return true;
+            }
           }
         }
       }
     } catch (_) {}
-    // Fallback: draw straight line between points and compute distance locally
     try {
       final km = _distCalc.as(LengthUnit.Kilometer, from, to);
       setState(() {
@@ -309,7 +519,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
         routeFare = km * _ratePerKm;
       });
       await _syncMapboxAnnotations();
-      await _fitCameraToTargets();
+      await _fitCameraToTargetsIfNeeded();
       return true;
     } catch (_) {}
     return false;
@@ -360,15 +570,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
     final span = spanLat > spanLng ? spanLat : spanLng;
     double zoom;
     if (span < 0.01) {
-      zoom = 15;
+      zoom = 16;
     } else if (span < 0.05) {
-      zoom = 13;
+      zoom = 15;
     } else if (span < 0.2) {
-      zoom = 11;
+      zoom = 13;
     } else if (span < 1.0) {
-      zoom = 9;
+      zoom = 11;
     } else {
-      zoom = 7;
+      zoom = 9;
+    }
+    double? brg;
+    if (fromCoord != null && toCoord != null) {
+      brg = _bearing(fromCoord!, toCoord!);
     }
     if (_mapbox != null) {
       await _mapbox!.setCamera(
@@ -377,10 +591,20 @@ class _NavigationScreenState extends State<NavigationScreen> {
             coordinates: mapbox.Position(center.longitude, center.latitude),
           ),
           zoom: zoom,
+          pitch: 55,
+          bearing: brg,
         ),
       );
+      _currentZoom = zoom;
     } else {
       mapController.move(center, zoom);
+    }
+  }
+
+  Future<void> _fitCameraToTargetsIfNeeded() async {
+    if (!_didInitialFit) {
+      await _fitCameraToTargets();
+      _didInitialFit = true;
     }
   }
 
@@ -419,19 +643,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
         ),
       );
     }
-    if (userCoord != null) {
-      await _pointManager!.create(
-        mapbox.PointAnnotationOptions(
-          geometry: mapbox.Point(
-            coordinates: mapbox.Position(
-              userCoord!.longitude,
-              userCoord!.latitude,
-            ),
-          ),
-          textField: (userAddress ?? 'You'),
-        ),
-      );
-    }
+
     _tapListener ??= _PointClick(_onPointAnnotationTap);
     _pointManager!.addOnPointAnnotationClickListener(_tapListener!);
     if (routePoints.isNotEmpty) {
@@ -441,18 +653,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
       await _polylineManager!.create(
         mapbox.PolylineAnnotationOptions(
           geometry: mapbox.LineString(coordinates: coords),
-          lineWidth: 6.0,
-          lineColor: Colors.blue.value,
-          lineOpacity: 0.9,
+          lineWidth: 8.0,
+          lineColor: const Color(0xFF00A3FF).value,
+          lineOpacity: 0.95,
         ),
       );
     }
-    await _fitCameraToTargets();
+    await _fitCameraToTargetsIfNeeded();
   }
 
   @override
   void dispose() {
     _posSub?.cancel();
+    _simTimer?.cancel();
     super.dispose();
   }
 
@@ -495,12 +708,33 @@ class _NavigationScreenState extends State<NavigationScreen> {
               distanceFilter: 10,
             ),
           ).listen((pos) async {
+            final now = DateTime.now();
+            final cur = LatLng(pos.latitude, pos.longitude);
+            double? kmh;
+            final sp = pos.speed;
+            if (sp != null && sp >= 0) {
+              kmh = sp * 3.6;
+            } else if (_lastSpeedCoord != null && _lastSpeedTime != null) {
+              final d = _distCalc.as(LengthUnit.Meter, _lastSpeedCoord!, cur);
+              final dt =
+                  now.difference(_lastSpeedTime!).inMilliseconds / 1000.0;
+              if (dt > 0) kmh = (d / dt) * 3.6;
+            }
+            _lastSpeedCoord = cur;
+            _lastSpeedTime = now;
             setState(() {
-              userCoord = LatLng(pos.latitude, pos.longitude);
+              userCoord = cur;
               centerCoord = userCoord;
+              if (kmh != null) _speedKmh = kmh;
             });
             if (_mapbox != null) {
-              await _mapbox!.setCamera(
+              double? brg;
+              if (_stepGeom.isNotEmpty) {
+                brg = _bearing(userCoord!, _stepGeom.last);
+              } else if (toCoord != null) {
+                brg = _bearing(userCoord!, toCoord!);
+              }
+              await _mapbox!.flyTo(
                 mapbox.CameraOptions(
                   center: mapbox.Point(
                     coordinates: mapbox.Position(
@@ -508,17 +742,35 @@ class _NavigationScreenState extends State<NavigationScreen> {
                       userCoord!.latitude,
                     ),
                   ),
-                  zoom: 13,
+                  zoom: 16,
+                  pitch: 60,
+                  bearing: brg,
                 ),
+                mapbox.MapAnimationOptions(duration: 800, startDelay: 0),
               );
+              _currentZoom = 16;
               await _syncMapboxAnnotations();
               if (_mapbox == null) {
                 mapController.move(userCoord!, 13);
               }
               await _recalcRouteFromUser();
+              _updateCurrentStep();
             }
           });
     } catch (_) {}
+  }
+
+  double _bearing(LatLng a, LatLng b) {
+    final lat1 = a.latitude * (3.141592653589793 / 180.0);
+    final lat2 = b.latitude * (3.141592653589793 / 180.0);
+    final dLon = (b.longitude - a.longitude) * (3.141592653589793 / 180.0);
+    final y = math.sin(dLon) * math.cos(lat2);
+    final x =
+        math.cos(lat1) * math.sin(lat2) -
+        math.sin(lat1) * math.cos(lat2) * math.cos(dLon);
+    var brng = math.atan2(y, x) * (180.0 / 3.141592653589793);
+    brng = (brng + 360.0) % 360.0;
+    return brng;
   }
 
   Future<String?> _reverseGeocode(LatLng p) async {
@@ -626,13 +878,306 @@ class _NavigationScreenState extends State<NavigationScreen> {
     final o = widget.order;
     return Scaffold(
       appBar: AppBar(title: const Text('Navigation')),
-      body: Column(
+      body: Stack(
         children: [
+          Positioned.fill(
+            child: GestureDetector(
+              onTap: () => setState(() => showInfoOverlay = !showInfoOverlay),
+              child: DriverSession.mapboxToken.isNotEmpty
+                  ? mapbox.MapWidget(
+                      styleUri: 'mapbox://styles/mapbox/navigation-night-v1',
+                      cameraOptions: mapbox.CameraOptions(
+                        center: mapbox.Point(
+                          coordinates: mapbox.Position(
+                            (centerCoord ??
+                                    fromCoord ??
+                                    toCoord ??
+                                    const LatLng(-26.2041, 28.0473))
+                                .longitude,
+                            (centerCoord ??
+                                    fromCoord ??
+                                    toCoord ??
+                                    const LatLng(-26.2041, 28.0473))
+                                .latitude,
+                          ),
+                        ),
+                        zoom: 15,
+                        pitch: 55,
+                        bearing: 0,
+                      ),
+                      onMapCreated: (m) async {
+                        _mapbox = m;
+                        try {
+                          await _mapbox!.location.updateSettings(
+                            mapbox.LocationComponentSettings(
+                              enabled: true,
+                              puckBearingEnabled: true,
+                              puckBearing: mapbox.PuckBearing.COURSE,
+                              locationPuck: mapbox.LocationPuck(
+                                locationPuck3D: mapbox.LocationPuck3D(
+                                  modelUri:
+                                      'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CarConcept/glTF-Binary/CarConcept.glb',
+                                  modelScale: [1.0, 1.0, 1.0],
+                                  modelRotation: [0.0, 0.0, 0.0],
+                                ),
+                              ),
+                            ),
+                          );
+                        } catch (_) {}
+                        await _syncMapboxAnnotations();
+                        try {
+                          await _mapbox!.style.addStyleLayer(
+                            '{"id":"3d-buildings","type":"fill-extrusion","source":"composite","source-layer":"building","filter":["==",["get","extrude"],"true"],"minzoom":15,"paint":{"fill-extrusion-color":"#aaa","fill-extrusion-height":["interpolate",["linear"],["zoom"],15,0,15.05,["get","height"]],"fill-extrusion-base":["interpolate",["linear"],["zoom"],15,0,15.05,["get","min_height"]],"fill-extrusion-opacity":0.6}}',
+                            null,
+                          );
+                          await _mapbox!.style.addStyleLayer(
+                            '{"id":"sky","type":"sky","paint":{"sky-type":"atmosphere","sky-atmosphere-sun-intensity":0.5}}',
+                            null,
+                          );
+                        } catch (_) {}
+                        if (widget.autoStart) {
+                          await _startNavigation();
+                        }
+                      },
+                    )
+                  : fmap.FlutterMap(
+                      mapController: mapController,
+                      options: fmap.MapOptions(
+                        initialCenter:
+                            centerCoord ??
+                            fromCoord ??
+                            toCoord ??
+                            const LatLng(-26.2041, 28.0473),
+                        initialZoom: 13,
+                      ),
+                      children: [
+                        fmap.TileLayer(
+                          urlTemplate:
+                              'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        ),
+                        if (fromCoord != null || toCoord != null)
+                          fmap.MarkerLayer(
+                            markers: [
+                              if (fromCoord != null)
+                                fmap.Marker(
+                                  point: fromCoord!,
+                                  width: 40,
+                                  height: 40,
+                                  child: const Icon(
+                                    Icons.location_on,
+                                    color: Colors.lightBlueAccent,
+                                    size: 36,
+                                  ),
+                                ),
+                              if (toCoord != null)
+                                fmap.Marker(
+                                  point: toCoord!,
+                                  width: 40,
+                                  height: 40,
+                                  child: const Icon(
+                                    Icons.flag,
+                                    color: Colors.redAccent,
+                                    size: 32,
+                                  ),
+                                ),
+                              if (userCoord != null)
+                                fmap.Marker(
+                                  point: userCoord!,
+                                  width: 36,
+                                  height: 36,
+                                  child: const Icon(
+                                    Icons.person_pin_circle,
+                                    color: Colors.greenAccent,
+                                    size: 32,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        if (routePoints.isNotEmpty)
+                          fmap.PolylineLayer(
+                            polylines: [
+                              fmap.Polyline(
+                                points: routePoints,
+                                color: Colors.blue,
+                                strokeWidth: 6,
+                              ),
+                            ],
+                          ),
+                      ],
+                    ),
+            ),
+          ),
+          if (loading)
+            const Positioned.fill(
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.white70),
+              ),
+            ),
+          Positioned(
+            top: 12,
+            left: 12,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: _stepName == null
+                  ? const SizedBox.shrink()
+                  : Container(
+                      key: ValueKey(_stepIndex.toString() + (_stepName ?? '')),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.85),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _turnIconFor(_stepType, _stepModifier),
+                            color: Colors.white,
+                            size: 24,
+                          ),
+                          const SizedBox(width: 10),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Builder(
+                                builder: (_) {
+                                  final d = _nextTurnDistanceMiles();
+                                  if (d == null) return const SizedBox.shrink();
+                                  return Text(
+                                    d.toStringAsFixed(1) + ' mi',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  );
+                                },
+                              ),
+                              Text(
+                                _stepName ?? '-',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Builder(
+                                builder: (_) {
+                                  final icons = <Widget>[];
+                                  final end = (_stepIndex + 4) < _steps.length
+                                      ? _stepIndex + 4
+                                      : _steps.length - 1;
+                                  for (int i = _stepIndex + 1; i <= end; i++) {
+                                    final s = _steps[i];
+                                    icons.add(
+                                      Icon(
+                                        _turnIconFor(s.type, s.modifier),
+                                        color: Colors.white70,
+                                        size: 18,
+                                      ),
+                                    );
+                                    if (i < end)
+                                      icons.add(const SizedBox(width: 6));
+                                  }
+                                  if (icons.isEmpty)
+                                    return const SizedBox.shrink();
+                                  return Row(children: icons);
+                                },
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+          ),
+          if (routeFare != null)
+            Positioned(
+              top: 12,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.7),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    'R ' + routeFare!.toStringAsFixed(2),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          Positioned(
+            top: 12,
+            left: 12,
+            child: Builder(
+              builder: (_) {
+                final miles = _nextTurnDistanceMiles();
+                final step = _stepName;
+                if (miles == null && (step == null || step.isEmpty)) {
+                  return const SizedBox.shrink();
+                }
+                final icons = <Widget>[];
+                final type = _stepType ?? '';
+                final mod = _stepModifier ?? '';
+                icons.add(
+                  Icon(_turnIconFor(type, mod), color: Colors.white, size: 18),
+                );
+                return Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.85),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ...icons,
+                      const SizedBox(width: 8),
+                      if (miles != null)
+                        Text(
+                          miles.toStringAsFixed(1) + ' mi',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      const SizedBox(width: 8),
+                      if (step != null && step.isNotEmpty)
+                        Text(
+                          step,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
           if (error != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            Positioned(
+              top: 64,
+              left: 16,
+              right: 16,
               child: Container(
-                width: double.infinity,
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: Colors.red.withOpacity(0.08),
@@ -656,220 +1201,229 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 ),
               ),
             ),
-          Expanded(
-            child: Container(
-              margin: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppTheme.bloodRed, width: 1.2),
-              ),
-              child: Stack(
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: DriverSession.mapboxToken.isNotEmpty
-                        ? mapbox.MapWidget(
-                            cameraOptions: mapbox.CameraOptions(
-                              center: mapbox.Point(
-                                coordinates: mapbox.Position(
-                                  (centerCoord ??
-                                          fromCoord ??
-                                          toCoord ??
-                                          const LatLng(-26.2041, 28.0473))
-                                      .longitude,
-                                  (centerCoord ??
-                                          fromCoord ??
-                                          toCoord ??
-                                          const LatLng(-26.2041, 28.0473))
-                                      .latitude,
-                                ),
-                              ),
-                              zoom: 13,
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: !showInfoOverlay
+                  ? const SizedBox.shrink()
+                  : Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.9),
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(16),
+                          topRight: Radius.circular(16),
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (o != null)
+                            Text(
+                              'Customer: ' + _clean(o.customerName),
+                              style: const TextStyle(color: Colors.white),
                             ),
-                            onMapCreated: (m) async {
-                              _mapbox = m;
-                              try {
-                                await _mapbox!.location.updateSettings(
-                                  mapbox.LocationComponentSettings(
-                                    enabled: true,
-                                  ),
-                                );
-                              } catch (_) {}
-                              await _syncMapboxAnnotations();
-                              if (widget.autoStart) {
-                                await _startNavigation();
-                              }
+                          Text(
+                            'From: ${o != null ? _clean(o.pickupAddress) : '-'}',
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                          Text(
+                            'To:   ${o != null ? _clean(o.deliveryAddress) : '-'}',
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                          const SizedBox(height: 6),
+                          Builder(
+                            builder: (_) {
+                              final dist = routeDistanceKm ?? o?.distanceKm;
+                              if (dist == null) return const SizedBox.shrink();
+                              return Text(
+                                'Distance: ' + dist.toStringAsFixed(1) + ' km',
+                                style: const TextStyle(color: Colors.white70),
+                              );
                             },
-                          )
-                        : fmap.FlutterMap(
-                            mapController: mapController,
-                            options: fmap.MapOptions(
-                              initialCenter:
-                                  centerCoord ??
-                                  fromCoord ??
-                                  toCoord ??
-                                  const LatLng(-26.2041, 28.0473),
-                              initialZoom: 13,
-                            ),
-                            children: [
-                              fmap.TileLayer(
-                                urlTemplate:
-                                    'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          ),
+                          Builder(
+                            builder: (_) {
+                              if (userCoord == null)
+                                return const SizedBox.shrink();
+                              final stage = navToPickup
+                                  ? 'To Pickup'
+                                  : 'To Dropoff';
+                              return Text(
+                                'Stage: ' + stage,
+                                style: const TextStyle(color: Colors.white70),
+                              );
+                            },
+                          ),
+                          if (routeFare != null)
+                            Text(
+                              'Cost: R ' + routeFare!.toStringAsFixed(2),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
                               ),
-                              if (fromCoord != null || toCoord != null)
-                                fmap.MarkerLayer(
-                                  markers: [
-                                    if (fromCoord != null)
-                                      fmap.Marker(
-                                        point: fromCoord!,
-                                        width: 40,
-                                        height: 40,
-                                        child: const Icon(
-                                          Icons.location_on,
-                                          color: Colors.lightBlueAccent,
-                                          size: 36,
-                                        ),
-                                      ),
-                                    if (toCoord != null)
-                                      fmap.Marker(
-                                        point: toCoord!,
-                                        width: 40,
-                                        height: 40,
-                                        child: const Icon(
-                                          Icons.flag,
-                                          color: Colors.redAccent,
-                                          size: 32,
-                                        ),
-                                      ),
-                                    if (userCoord != null)
-                                      fmap.Marker(
-                                        point: userCoord!,
-                                        width: 36,
-                                        height: 36,
-                                        child: const Icon(
-                                          Icons.person_pin_circle,
-                                          color: Colors.greenAccent,
-                                          size: 32,
-                                        ),
-                                      ),
-                                  ],
+                            ),
+                          if (o != null)
+                            Text(
+                              'Offer: R ' + o.payout.toStringAsFixed(2),
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: widget.autoStart
+                                      ? null
+                                      : () async {
+                                          if (o != null) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Starting navigation...',
+                                                ),
+                                              ),
+                                            );
+                                            await _startNavigation();
+                                          }
+                                        },
+                                  child: Text(
+                                    widget.autoStart ? 'Started' : 'Start',
+                                  ),
                                 ),
-                              if (routePoints.isNotEmpty)
-                                fmap.PolylineLayer(
-                                  polylines: [
-                                    fmap.Polyline(
-                                      points: routePoints,
-                                      color: Colors.blue,
-                                      strokeWidth: 6,
-                                    ),
-                                  ],
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: () async {
+                                    if (o != null) {
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).hideCurrentSnackBar();
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'Cancelling delivery...',
+                                          ),
+                                        ),
+                                      );
+                                      final ok =
+                                          await ApiClient.updateOrderStatus(
+                                            o.id,
+                                            'awaiting',
+                                            action: 'update_status',
+                                          );
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).hideCurrentSnackBar();
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            ok
+                                                ? 'Order returned to awaiting'
+                                                : 'Failed to cancel delivery',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                    if (mounted) Navigator.pop(context);
+                                  },
+                                  child: const Text('Cancel'),
                                 ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: () async {
+                                    if (o != null) {
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        const SnackBar(
+                                          content: Text('Marking delivered...'),
+                                        ),
+                                      );
+                                      final ok =
+                                          await ApiClient.updateOrderStatus(
+                                            o.id,
+                                            'delivered',
+                                            action: 'update_status',
+                                            extra: {
+                                              'driver_delivery_time':
+                                                  ApiClient.nowTs(),
+                                              if (routeFare != null)
+                                                'delivery_fee': routeFare,
+                                            },
+                                          );
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).hideCurrentSnackBar();
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            ok
+                                                ? 'Delivery marked as complete'
+                                                : 'Failed to update delivery',
+                                          ),
+                                        ),
+                                      );
+                                      if (ok && mounted) Navigator.pop(context);
+                                    }
+                                  },
+                                  child: const Text('Delivered'),
+                                ),
+                              ),
                             ],
                           ),
-                  ),
-                  if (loading)
-                    const Center(
-                      child: CircularProgressIndicator(color: Colors.white70),
+                        ],
+                      ),
                     ),
-                ],
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (o != null) Text('Customer: ' + _clean(o.customerName)),
-                    Text('From: ${o != null ? _clean(o.pickupAddress) : '-'}'),
-                    Text(
-                      'To:   ${o != null ? _clean(o.deliveryAddress) : '-'}',
-                    ),
-                    Builder(
-                      builder: (_) {
-                        if (fromCoord == null && toCoord == null) {
-                          return const SizedBox.shrink();
-                        }
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            if (fromCoord != null)
-                              Text(
-                                'Pickup coords: ${fromCoord!.latitude.toStringAsFixed(5)}, ${fromCoord!.longitude.toStringAsFixed(5)}',
-                              ),
-                            if (toCoord != null)
-                              Text(
-                                'Dropoff coords: ${toCoord!.latitude.toStringAsFixed(5)}, ${toCoord!.longitude.toStringAsFixed(5)}',
-                              ),
-                          ],
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 4),
-                    Builder(
-                      builder: (_) {
-                        final dist = routeDistanceKm ?? o?.distanceKm;
-                        if (dist == null) return const SizedBox.shrink();
-                        return Text(
-                          'Distance: ' + dist.toStringAsFixed(1) + ' km',
-                        );
-                      },
-                    ),
-                    Builder(
-                      builder: (_) {
-                        if (userCoord == null) return const SizedBox.shrink();
-                        final stage = navToPickup ? 'To Pickup' : 'To Dropoff';
-                        return Text('Stage: ' + stage);
-                      },
-                    ),
-                    Builder(
-                      builder: (_) {
-                        final cost = routeFare;
-                        if (cost == null) return const SizedBox.shrink();
-                        return Text(
-                          'Cost: R ' + cost.toStringAsFixed(2),
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton(
-                            onPressed: () async {
-                              if (o != null) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text('Starting navigation...'),
-                                  ),
-                                );
-                                await _startNavigation();
-                              }
-                            },
-                            child: const Text('Start'),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: ElevatedButton(
-                            onPressed: () => Navigator.pop(context),
-                            child: const Text('Back'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
             ),
           ),
         ],
       ),
     );
   }
+
+  Future<void> _zoomBy(double delta) async {
+    final z = (_currentZoom + delta).clamp(3.0, 20.0);
+    _currentZoom = z;
+    if (_mapbox != null) {
+      await _mapbox!.flyTo(
+        mapbox.CameraOptions(zoom: z),
+        mapbox.MapAnimationOptions(duration: 250, startDelay: 0),
+      );
+    } else {
+      mapController.move(centerCoord ?? const LatLng(-26.2041, 28.0473), z);
+    }
+  }
+
+  Future<void> _recenterCamera() async {
+    _didInitialFit = false;
+    await _fitCameraToTargetsIfNeeded();
+  }
+}
+
+class _NavStep {
+  final String name;
+  final double distance;
+  final String type;
+  final String modifier;
+  final List<LatLng> geom;
+  const _NavStep(this.name, this.distance, this.type, this.modifier, this.geom);
 }
