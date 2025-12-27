@@ -70,7 +70,18 @@ class ApiClient {
         .replaceAll('&#39;', "'")
         .replaceAll('&quot;', '"');
     final c = b.replaceAll(RegExp(r"\s+"), ' ').trim();
+    final lc = c.toLowerCase();
+    if (lc.contains('404 not found') || lc == 'not found') return '';
     return c;
+  }
+
+  static String _normalizePhone(String? v) {
+    final s = (v ?? '').toString().trim();
+    if (s.isEmpty) return '';
+    final hasPlus = s.startsWith('+');
+    final digits = s.replaceAll(RegExp(r'[^0-9]'), '');
+    if (digits.isEmpty) return '';
+    return hasPlus ? ('+' + digits) : digits;
   }
 
   static Future<UserProfile?> login(String identifier, String password) async {
@@ -277,11 +288,15 @@ class ApiClient {
             final lng = double.tryParse(
               (e['longitude'] ?? e['dealer_longitude'] ?? '').toString(),
             );
+            final phone =
+                (e['delivery_phone'] ?? e['customer_phone'] ?? e['phone'] ?? '')
+                    .toString();
             return Order(
               id: _s(e['order_id']?.toString()),
               customerName: _s(
                 name.isEmpty ? (e['delivery_phone'] ?? '').toString() : name,
               ),
+              customerPhone: _normalizePhone(phone),
               pickupAddress: _s(
                 (e['dealer_address'] ?? e['business_address'] ?? '').toString(),
               ),
@@ -477,11 +492,15 @@ class ApiClient {
             final payoutNum = (e['total_amount'] is num)
                 ? (e['total_amount'] as num).toDouble()
                 : double.tryParse((e['total_amount'] ?? '0').toString()) ?? 0.0;
+            final phone =
+                (e['delivery_phone'] ?? e['customer_phone'] ?? e['phone'] ?? '')
+                    .toString();
             return Order(
               id: _s(e['order_id']?.toString()),
               customerName: _s(
                 name.isEmpty ? (e['delivery_phone'] ?? '').toString() : name,
               ),
+              customerPhone: _normalizePhone(phone),
               pickupAddress: _s((e['dealer_address'] ?? '').toString()),
               deliveryAddress: _s((e['delivery_address'] ?? '').toString()),
               status: _s((e['status'] ?? 'confirmed').toString()),
@@ -822,11 +841,18 @@ class ApiClient {
               ? (details['total_amount'] as num).toDouble()
               : double.tryParse((details['total_amount'] ?? '0').toString()) ??
                     0.0;
+          final phone =
+              (customer['phone'] ??
+                      details['delivery_phone'] ??
+                      details['phone'] ??
+                      '')
+                  .toString();
           return Order(
             id: _s((e['order_id'] ?? '').toString()),
             customerName: _s(
               name.isEmpty ? (customer['email'] ?? '').toString() : name,
             ),
+            customerPhone: _normalizePhone(phone),
             pickupAddress: _s((dealer['business_address'] ?? '').toString()),
             deliveryAddress: _s((details['delivery_address'] ?? '').toString()),
             status: _s((details['status'] ?? 'awaiting').toString()),
@@ -1007,12 +1033,85 @@ class ApiClient {
         return Order(
           id: _s((o['order_id'] ?? o['id'] ?? '').toString()),
           customerName: _s((o['customer_name'] ?? '').toString()),
+          customerPhone: _normalizePhone(
+            (o['customer_phone'] ?? o['delivery_phone'] ?? o['phone'] ?? '')
+                ?.toString(),
+          ),
           pickupAddress: _s((o['pickup_address'] ?? '').toString()),
           deliveryAddress: _s((o['delivery_address'] ?? '').toString()),
           status: _s((o['status'] ?? 'awaiting').toString()),
           payout: double.tryParse((o['payout'] ?? '0').toString()) ?? 0.0,
         );
       }
+    }
+    return null;
+  }
+
+  static Future<Order?> fetchOrderDetailsFromOrdersPage(dynamic orderId) async {
+    final uri = Uri.parse(
+      ApiEndpoints.ordersPage,
+    ).replace(queryParameters: {'order_id': orderId.toString()});
+    final res = await http
+        .get(uri, headers: {'Accept': 'application/json'})
+        .timeout(const Duration(seconds: 12));
+    if (res.statusCode == 200) {
+      try {
+        final data = jsonDecode(res.body);
+        Map<String, dynamic>? o;
+        if (data is Map) {
+          if (data['order'] is Map) {
+            o = Map<String, dynamic>.from(data['order'] as Map);
+          } else if (data['data'] is Map &&
+              (data['data'] as Map)['order'] is Map) {
+            o = Map<String, dynamic>.from(
+              (data['data'] as Map)['order'] as Map,
+            );
+          } else if (data['orders'] is List) {
+            final list = List<Map<String, dynamic>>.from(data['orders']);
+            o = list.firstWhere(
+              (e) =>
+                  ((e['order_id'] ?? e['id'] ?? '').toString()) ==
+                  orderId.toString(),
+              orElse: () => <String, dynamic>{},
+            );
+          }
+        }
+        if (o != null && o.isNotEmpty) {
+          final first = (o['customer_first_name'] ?? '').toString();
+          final last = (o['customer_last_name'] ?? '').toString();
+          final nameRaw = (first + ' ' + last).trim();
+          final name = nameRaw.isNotEmpty
+              ? nameRaw
+              : (o['customer_name'] ?? '').toString();
+          final payoutNum = (o['total_amount'] is num)
+              ? (o['total_amount'] as num).toDouble()
+              : double.tryParse((o['total_amount'] ?? '0').toString()) ?? 0.0;
+          final phone =
+              (o['delivery_phone'] ?? o['customer_phone'] ?? o['phone'] ?? '')
+                  .toString();
+          final lat = double.tryParse(
+            (o['latitude'] ?? o['dealer_latitude'] ?? '').toString(),
+          );
+          final lng = double.tryParse(
+            (o['longitude'] ?? o['dealer_longitude'] ?? '').toString(),
+          );
+          return Order(
+            id: _s((o['order_id'] ?? o['id'] ?? '').toString()),
+            customerName: _s(
+              name.isNotEmpty ? name : (o['customer_email'] ?? '').toString(),
+            ),
+            customerPhone: _normalizePhone(phone),
+            pickupAddress: _s(
+              (o['dealer_address'] ?? o['business_address'] ?? '').toString(),
+            ),
+            deliveryAddress: _s((o['delivery_address'] ?? '').toString()),
+            status: _s((o['status'] ?? 'awaiting').toString()),
+            payout: payoutNum,
+            dealerLat: lat,
+            dealerLng: lng,
+          );
+        }
+      } catch (_) {}
     }
     return null;
   }

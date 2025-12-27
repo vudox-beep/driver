@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import '../services/api_client.dart';
 import 'dart:convert';
 import 'package:latlong2/latlong.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class OrderDetailsScreen extends StatefulWidget {
   final Order? order;
@@ -21,6 +22,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   double? distanceKm;
   double? pay;
   static const double _ratePerKm = 5.0;
+  bool navigationStarted = false;
 
   String _clean(String? v) {
     final s = (v ?? '').toString();
@@ -43,61 +45,19 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       error = null;
     });
     try {
-      final uri = Uri.parse(ApiEndpoints.orderDetails);
-      final res = await http
-          .post(
-            uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'order_id': int.tryParse(widget.order!.id) ?? widget.order!.id,
-            }),
-          )
-          .timeout(const Duration(seconds: 12));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data is Map && data['success'] == true) {
-          final o = (data['data'] is Map && data['data']['order'] is Map)
-              ? data['data']['order'] as Map<String, dynamic>
-              : <String, dynamic>{};
-          setState(() {
-            details = Order(
-              id: (o['order_id'] ?? o['id'] ?? widget.order!.id).toString(),
-              customerName: _clean(
-                o['customer_name'] ?? widget.order!.customerName,
-              ),
-              pickupAddress: _clean(
-                o['pickup_address'] ?? widget.order!.pickupAddress,
-              ),
-              deliveryAddress: _clean(
-                o['delivery_address'] ?? widget.order!.deliveryAddress,
-              ),
-              status: _clean(o['status'] ?? widget.order!.status),
-              payout: widget.order!.payout,
-            );
-          });
-          await _computePriceFor(details!);
-        } else {
-          setState(() {
-            error = (data is Map && data['message'] is String)
-                ? _clean(data['message'] as String)
-                : 'Failed to load order';
-          });
-        }
+      final d = await ApiClient.fetchOrderDetailsFromOrdersPage(
+        widget.order!.id,
+      );
+      if (d != null) {
+        setState(() => details = d);
+        await _computePriceFor(d);
       } else {
-        setState(() {
-          error = res.body.isNotEmpty
-              ? _clean(res.body)
-              : 'Failed to load order';
-        });
+        setState(() => error = 'Failed to load order');
       }
     } catch (_) {
-      setState(() {
-        error = 'Network error';
-      });
+      setState(() => error = 'Network error');
     } finally {
-      setState(() {
-        loading = false;
-      });
+      setState(() => loading = false);
     }
   }
 
@@ -277,52 +237,207 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton(
-                    onPressed: o == null
-                        ? null
-                        : () => Navigator.pushNamed(
-                            context,
-                            '/navigate',
-                            arguments: o,
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final w = constraints.maxWidth;
+                final btnW = w >= 560 ? (w - 36) / 4 : (w - 12) / 2;
+                return Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    SizedBox(
+                      width: btnW,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(0, 44),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
                           ),
-                    child: const Text('Navigate'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: ElevatedButton(
-                    onPressed: o == null
-                        ? null
-                        : () async {
-                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Updating status...'),
-                              ),
-                            );
-                            final ok = await ApiClient.updateOrderStatus(
-                              o!.id,
-                              'delivered',
-                              action: 'update_status',
-                            );
-                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(
-                                  ok
-                                      ? 'Marked as delivered'
-                                      : 'Failed to update status',
-                                ),
-                              ),
-                            );
-                          },
-                    child: const Text('Mark Delivered'),
-                  ),
-                ),
-              ],
+                        ),
+                        onPressed: o == null
+                            ? null
+                            : () async {
+                                final res = await Navigator.pushNamed(
+                                  context,
+                                  '/navigate',
+                                  arguments: {'order': o, 'autoStart': true},
+                                );
+                                if (!mounted) return;
+                                setState(() {
+                                  navigationStarted =
+                                      (res is Map && (res['started'] == true));
+                                });
+                              },
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: const [
+                            Icon(Icons.navigation, size: 18),
+                            SizedBox(width: 6),
+                            Text('Navigate'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: btnW,
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(0, 44),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: (o == null || !navigationStarted)
+                            ? null
+                            : () async {
+                                ScaffoldMessenger.of(
+                                  context,
+                                ).hideCurrentSnackBar();
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Cancelling delivery...'),
+                                  ),
+                                );
+                                final ok = await ApiClient.updateOrderStatus(
+                                  o!.id,
+                                  'awaiting',
+                                  action: 'update_status',
+                                );
+                                ScaffoldMessenger.of(
+                                  context,
+                                ).hideCurrentSnackBar();
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      ok
+                                          ? 'Order returned to awaiting'
+                                          : 'Failed to cancel',
+                                    ),
+                                  ),
+                                );
+                                if (ok && mounted) Navigator.pop(context);
+                              },
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: const [
+                            Icon(Icons.cancel_outlined, size: 18),
+                            SizedBox(width: 6),
+                            Text('Cancel'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: btnW,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(0, 44),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: (o == null || !navigationStarted)
+                            ? null
+                            : () async {
+                                ScaffoldMessenger.of(
+                                  context,
+                                ).hideCurrentSnackBar();
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Marking delivered...'),
+                                  ),
+                                );
+                                final ok = await ApiClient.updateOrderStatus(
+                                  o!.id,
+                                  'delivered',
+                                  action: 'update_status',
+                                );
+                                ScaffoldMessenger.of(
+                                  context,
+                                ).hideCurrentSnackBar();
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      ok
+                                          ? 'Marked as delivered'
+                                          : 'Failed to update status',
+                                    ),
+                                  ),
+                                );
+                                if (ok && mounted) Navigator.pop(context);
+                              },
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: const [
+                            Icon(Icons.check_circle_outline, size: 18),
+                            SizedBox(width: 6),
+                            Text('Delivered'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: btnW,
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(0, 44),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        onPressed: (o == null || !navigationStarted)
+                            ? null
+                            : () async {
+                                String phone = (o!.customerPhone ?? '').trim();
+                                if (phone.isEmpty) {
+                                  final fetched =
+                                      await ApiClient.fetchOrderDetailsFromOrdersPage(
+                                        o.id,
+                                      );
+                                  if (fetched?.customerPhone?.isNotEmpty ==
+                                      true) {
+                                    phone = fetched!.customerPhone!;
+                                  }
+                                }
+                                if (phone.isEmpty) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('No customer phone'),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                final uri = Uri.parse('tel:' + phone);
+                                try {
+                                  await launchUrl(
+                                    uri,
+                                    mode: LaunchMode.externalApplication,
+                                  );
+                                } catch (_) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Unable to open dialer'),
+                                    ),
+                                  );
+                                }
+                              },
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: const [
+                            Icon(Icons.phone_outlined, size: 18),
+                            SizedBox(width: 6),
+                            Text('Call'),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
           ],
         ),

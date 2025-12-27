@@ -1,6 +1,7 @@
 class Order {
   final String id;
   final String customerName;
+  final String? customerPhone;
   final String pickupAddress;
   final String deliveryAddress;
   final String status;
@@ -12,6 +13,7 @@ class Order {
   const Order({
     required this.id,
     required this.customerName,
+    this.customerPhone,
     required this.pickupAddress,
     required this.deliveryAddress,
     required this.status,

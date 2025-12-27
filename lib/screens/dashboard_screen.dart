@@ -34,10 +34,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _distance = const Distance();
   static const double _ratePerKm = 5.0;
   Timer? _ordersTimer;
+  Timer? _statsTimer;
   StreamSubscription<Position>? _posSub;
+  void _safeSetState(VoidCallback fn) {
+    if (!mounted) return;
+    setState(fn);
+  }
 
   Future<void> fetchOrders() async {
-    setState(() {
+    _safeSetState(() {
       loadingOrders = true;
       ordersError = null;
     });
@@ -52,13 +57,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }).toList(),
       );
       final mineWithDist = _applyDistanceFilter(mine);
-      setState(() {
+      _safeSetState(() {
         _myOrders
           ..clear()
           ..addAll(mineWithDist);
-        final combined = <Order>[]
-          ..addAll(_myOrders)
-          ..addAll(nearbyAvail);
+        final map = <String, Order>{};
+        for (final o in _myOrders) {
+          map[o.id] = o;
+        }
+        for (final o in nearbyAvail) {
+          map.putIfAbsent(o.id, () => o);
+        }
+        final combined = map.values.toList();
         orders
           ..clear()
           ..addAll(combined);
@@ -67,11 +77,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         }
       });
     } catch (_) {
-      setState(() {
+      _safeSetState(() {
         ordersError = 'Network error';
       });
     } finally {
-      setState(() {
+      _safeSetState(() {
         loadingOrders = false;
       });
     }
@@ -129,6 +139,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     fetchOrders();
     fetchDashboardStats();
     _startPolling();
+    _startStatsPolling();
     _startPositionStream();
   }
 
@@ -171,7 +182,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     try {
       final d = await ApiClient.fetchDashboard(currentUser!.driverId!);
       if (d != null) {
-        setState(() {
+        _safeSetState(() {
           dashboardTotal = (d['total_earnings'] as num?)?.toDouble();
           dashboardDelivered = (d['deliveries_count'] as num?)?.toInt();
           dashboardActive = (d['active_orders'] as num?)?.toInt();
@@ -184,6 +195,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _ordersTimer?.cancel();
     _ordersTimer = Timer.periodic(const Duration(seconds: 60), (_) {
       fetchOrders();
+    });
+  }
+
+  void _startStatsPolling() {
+    _statsTimer?.cancel();
+    _statsTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      fetchDashboardStats();
     });
   }
 
@@ -265,7 +283,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
       return o;
     }).toList();
-    setState(() {
+    _safeSetState(() {
       orders
         ..clear()
         ..addAll(updated);
@@ -275,6 +293,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     _ordersTimer?.cancel();
+    _statsTimer?.cancel();
     _posSub?.cancel();
     super.dispose();
   }
@@ -508,16 +527,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 padding: const EdgeInsets.all(16),
                 child: Card(
                   child: InkWell(
-                    onTap: () {
+                    onTap: () async {
                       if (widget.onSelectOrder != null) {
                         widget.onSelectOrder!(order);
                         widget.goToDetails?.call();
                       } else {
-                        Navigator.pushNamed(
+                        await Navigator.pushNamed(
                           context,
                           '/orderDetails',
                           arguments: order,
                         );
+                        await fetchOrders();
+                        await fetchDashboardStats();
                       }
                     },
                     child: Padding(
@@ -552,220 +573,309 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             'Dropoff: ${order.deliveryAddress.replaceAll(RegExp(r"<[^>]*>"), '')}',
                           ),
                           const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Flexible(
-                                child: ElevatedButton(
-                                  onPressed: () async {
-                                    final dist = order.distanceKm;
-                                    final pay = dist != null
-                                        ? dist * _ratePerKm
-                                        : null;
-                                    final okConfirm =
-                                        await showDialog<bool>(
-                                          context: context,
-                                          builder: (_) {
-                                            return AlertDialog(
-                                              title: const Text('Accept Order'),
-                                              content: Column(
-                                                mainAxisSize: MainAxisSize.min,
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
-                                                children: [
-                                                  Text(
-                                                    'Customer: ' +
-                                                        order.customerName
-                                                            .replaceAll(
-                                                              RegExp(
-                                                                r"<[^>]*>",
-                                                              ),
-                                                              '',
-                                                            ),
+                          LayoutBuilder(
+                            builder: (context, constraints) {
+                              final w = constraints.maxWidth;
+                              final btnW = (w - 12) / 2;
+                              return Wrap(
+                                spacing: 12,
+                                runSpacing: 8,
+                                children: [
+                                  SizedBox(
+                                    width: btnW,
+                                    child: ElevatedButton(
+                                      style: ElevatedButton.styleFrom(
+                                        minimumSize: const Size(0, 40),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 10,
+                                        ),
+                                      ),
+                                      onPressed: () async {
+                                        final dist = order.distanceKm;
+                                        final pay = dist != null
+                                            ? dist * _ratePerKm
+                                            : null;
+                                        final okConfirm =
+                                            await showDialog<bool>(
+                                              context: context,
+                                              builder: (_) {
+                                                return AlertDialog(
+                                                  title: const Text(
+                                                    'Accept Order',
                                                   ),
-                                                  const SizedBox(height: 6),
-                                                  if (dist != null)
-                                                    Text(
-                                                      'Distance: ' +
-                                                          dist.toStringAsFixed(
-                                                            1,
-                                                          ) +
-                                                          ' km',
-                                                    ),
-                                                  if (pay != null)
-                                                    Text(
-                                                      'Pay: R ' +
-                                                          pay.toStringAsFixed(
-                                                            2,
+                                                  content: Column(
+                                                    mainAxisSize:
+                                                        MainAxisSize.min,
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      Text(
+                                                        'Customer: ' +
+                                                            order.customerName
+                                                                .replaceAll(
+                                                                  RegExp(
+                                                                    r"<[^>]*>",
+                                                                  ),
+                                                                  '',
+                                                                ),
+                                                      ),
+                                                      const SizedBox(height: 6),
+                                                      if (dist != null)
+                                                        Text(
+                                                          'Distance: ' +
+                                                              dist.toStringAsFixed(
+                                                                1,
+                                                              ) +
+                                                              ' km',
+                                                        ),
+                                                      if (pay != null)
+                                                        Text(
+                                                          'Pay: R ' +
+                                                              pay.toStringAsFixed(
+                                                                2,
+                                                              ),
+                                                        ),
+                                                    ],
+                                                  ),
+                                                  actions: [
+                                                    TextButton(
+                                                      onPressed: () =>
+                                                          Navigator.pop(
+                                                            context,
+                                                            false,
                                                           ),
+                                                      child: const Text(
+                                                        'Cancel',
+                                                      ),
                                                     ),
-                                                ],
-                                              ),
-                                              actions: [
-                                                TextButton(
-                                                  onPressed: () =>
-                                                      Navigator.pop(
-                                                        context,
-                                                        false,
+                                                    ElevatedButton(
+                                                      onPressed: () =>
+                                                          Navigator.pop(
+                                                            context,
+                                                            true,
+                                                          ),
+                                                      child: const Text(
+                                                        'Accept',
                                                       ),
-                                                  child: const Text('Cancel'),
-                                                ),
-                                                ElevatedButton(
-                                                  onPressed: () =>
-                                                      Navigator.pop(
-                                                        context,
-                                                        true,
-                                                      ),
-                                                  child: const Text('Accept'),
-                                                ),
-                                              ],
-                                            );
-                                          },
-                                        ) ??
-                                        false;
-                                    if (!okConfirm) return;
-                                    ScaffoldMessenger.of(
-                                      context,
-                                    ).hideCurrentSnackBar();
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Accepting order...'),
-                                      ),
-                                    );
-                                    bool okAccept = false;
-                                    try {
-                                      okAccept = await ApiClient.acceptOrder(
-                                        order.id,
-                                        proposedFee: pay,
-                                        pickupTime: DateTime.now(),
-                                      );
-                                    } catch (_) {}
-                                    ScaffoldMessenger.of(
-                                      context,
-                                    ).hideCurrentSnackBar();
-                                    if (!okAccept) {
-                                      final err =
-                                          ApiClient.lastError ??
-                                          'Failed to accept order';
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        SnackBar(content: Text(err)),
-                                      );
-                                      return;
-                                    }
-                                    // Start navigation immediately without waiting for assignment polling
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Starting navigation...'),
-                                      ),
-                                    );
-                                    if (widget.onSelectOrder != null) {
-                                      widget.onSelectOrder!(order);
-                                      widget.goToNavigate?.call();
-                                    } else {
-                                      final usedExternal =
-                                          DriverSession.mapboxToken.isEmpty
-                                          ? await _openExternalDirections(order)
-                                          : false;
-                                      if (!usedExternal) {
-                                        Navigator.pushNamed(
+                                                    ),
+                                                  ],
+                                                );
+                                              },
+                                            ) ??
+                                            false;
+                                        if (!okConfirm) return;
+                                        ScaffoldMessenger.of(
                                           context,
-                                          '/navigate',
-                                          arguments: {
-                                            'order': order,
-                                            'autoStart': true,
-                                          },
-                                        );
-                                      }
-                                    }
-                                    try {
-                                      final okStatus =
-                                          await ApiClient.updateOrderStatus(
-                                            order.id,
-                                            'picked_up',
-                                            action: 'update_status',
-                                            extra: {
-                                              'driver_pickup_time':
-                                                  ApiClient.nowTs(),
-                                              'driver_assigned_at':
-                                                  ApiClient.nowTs(),
-                                              if (pay != null) 'fee': pay,
-                                              if (pay != null)
-                                                'delivery_fee': pay,
-                                            },
-                                          );
-                                      if (!okStatus) {
-                                        final err =
-                                            ApiClient.lastError ??
-                                            'Failed to update status';
+                                        ).hideCurrentSnackBar();
                                         ScaffoldMessenger.of(
                                           context,
                                         ).showSnackBar(
-                                          SnackBar(content: Text(err)),
+                                          const SnackBar(
+                                            content: Text('Accepting order...'),
+                                          ),
                                         );
-                                      }
-                                    } catch (_) {}
-                                    try {
-                                      await fetchOrders();
-                                    } catch (_) {}
-                                  },
-                                  child: const Text('Accept'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Flexible(
-                                child: TextButton(
-                                  onPressed: () async {
-                                    final ok = await ApiClient.rejectOrder(
-                                      order.id,
-                                    );
-                                    if (ok) {
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        const SnackBar(
-                                          content: Text('Order rejected'),
+                                        bool okAccept = false;
+                                        try {
+                                          okAccept =
+                                              await ApiClient.acceptOrder(
+                                                order.id,
+                                                proposedFee: pay,
+                                                pickupTime: DateTime.now(),
+                                              );
+                                        } catch (_) {}
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).hideCurrentSnackBar();
+                                        if (!okAccept) {
+                                          final err =
+                                              ApiClient.lastError ??
+                                              'Failed to accept order';
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            SnackBar(content: Text(err)),
+                                          );
+                                          return;
+                                        }
+                                        // Start navigation immediately without waiting for assignment polling
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).showSnackBar(
+                                          const SnackBar(
+                                            content: Text(
+                                              'Starting navigation...',
+                                            ),
+                                          ),
+                                        );
+                                        if (widget.onSelectOrder != null) {
+                                          widget.onSelectOrder!(order);
+                                          widget.goToNavigate?.call();
+                                        } else {
+                                          final usedExternal =
+                                              DriverSession.mapboxToken.isEmpty
+                                              ? await _openExternalDirections(
+                                                  order,
+                                                )
+                                              : false;
+                                          if (!usedExternal) {
+                                            await Navigator.pushNamed(
+                                              context,
+                                              '/navigate',
+                                              arguments: {
+                                                'order': order,
+                                                'autoStart': true,
+                                              },
+                                            );
+                                            await fetchOrders();
+                                            await fetchDashboardStats();
+                                          } else {
+                                            await Future.delayed(
+                                              const Duration(seconds: 2),
+                                            );
+                                            await fetchOrders();
+                                            await fetchDashboardStats();
+                                          }
+                                        }
+                                        try {
+                                          final okStatus =
+                                              await ApiClient.updateOrderStatus(
+                                                order.id,
+                                                'picked_up',
+                                                action: 'update_status',
+                                                extra: {
+                                                  'driver_pickup_time':
+                                                      ApiClient.nowTs(),
+                                                  'driver_assigned_at':
+                                                      ApiClient.nowTs(),
+                                                  if (pay != null) 'fee': pay,
+                                                  if (pay != null)
+                                                    'delivery_fee': pay,
+                                                },
+                                              );
+                                          if (!okStatus) {
+                                            final err =
+                                                ApiClient.lastError ??
+                                                'Failed to update status';
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              SnackBar(content: Text(err)),
+                                            );
+                                          }
+                                        } catch (_) {}
+                                        try {
+                                          await fetchOrders();
+                                          await fetchDashboardStats();
+                                        } catch (_) {}
+                                      },
+                                      child: Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        children: const [
+                                          Icon(
+                                            Icons.check_circle_outline,
+                                            size: 18,
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text('Accept'),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(
+                                    width: btnW,
+                                    child: TextButton(
+                                      style: TextButton.styleFrom(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 10,
                                         ),
-                                      );
-                                      fetchOrders();
-                                    } else {
-                                      final noAuth =
-                                          (DriverSession.authToken ?? '')
-                                              .isEmpty &&
-                                          (currentUser?.driverId == null);
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        SnackBar(
-                                          content: Text(
-                                            noAuth
-                                                ? 'Please log in as driver to reject orders'
-                                                : 'Failed to reject order',
+                                      ),
+                                      onPressed: () async {
+                                        final ok = await ApiClient.rejectOrder(
+                                          order.id,
+                                        );
+                                        if (ok) {
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            const SnackBar(
+                                              content: Text('Order rejected'),
+                                            ),
+                                          );
+                                          await fetchOrders();
+                                          await fetchDashboardStats();
+                                        } else {
+                                          final noAuth =
+                                              (DriverSession.authToken ?? '')
+                                                  .isEmpty &&
+                                              (currentUser?.driverId == null);
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            SnackBar(
+                                              content: Text(
+                                                noAuth
+                                                    ? 'Please log in as driver to reject orders'
+                                                    : 'Failed to reject order',
+                                              ),
+                                            ),
+                                          );
+                                        }
+                                      },
+                                      child: Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        children: const [
+                                          Icon(Icons.cancel_outlined, size: 18),
+                                          SizedBox(width: 6),
+                                          Text('Reject'),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  Builder(
+                                    builder: (_) {
+                                      final d = order.distanceKm;
+                                      if (d == null)
+                                        return const SizedBox.shrink();
+                                      final pay = d * _ratePerKm;
+                                      return Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 8,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.white12,
+                                          borderRadius: BorderRadius.circular(
+                                            10,
                                           ),
                                         ),
+                                        child: Text(
+                                          'Pay: R ' + pay.toStringAsFixed(2),
+                                        ),
                                       );
-                                    }
-                                  },
-                                  child: const Text('Reject'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Builder(
-                                builder: (_) {
-                                  final d = order.distanceKm;
-                                  if (d == null) return const SizedBox.shrink();
-                                  final pay = d * _ratePerKm;
-                                  return Text(
-                                    'Pay: R ' + pay.toStringAsFixed(2),
-                                  );
-                                },
-                              ),
-                              const SizedBox(width: 12),
-                              if (order.distanceKm != null)
-                                Text(
-                                  '${order.distanceKm!.toStringAsFixed(1)} km',
-                                ),
-                            ],
+                                    },
+                                  ),
+                                  if (order.distanceKm != null)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 8,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white12,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Text(
+                                        '${order.distanceKm!.toStringAsFixed(1)} km',
+                                      ),
+                                    ),
+                                ],
+                              );
+                            },
                           ),
                         ],
                       ),

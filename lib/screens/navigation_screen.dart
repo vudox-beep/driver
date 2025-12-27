@@ -61,6 +61,9 @@ class _NavigationScreenState extends State<NavigationScreen> {
   String? _stepType;
   String? _stepModifier;
   List<LatLng> _stepGeom = const [];
+  bool _started = false;
+  DateTime? _lastCamUpdate;
+  double? _lastBearing;
   double _kmToMiles(double km) => km * 0.621371;
   double? _speedKmh;
   LatLng? _lastSpeedCoord;
@@ -266,6 +269,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       );
       return;
     }
+    _started = true;
     if (DriverSession.mapboxToken.isNotEmpty) {
       setState(() {
         fromCoord = from;
@@ -440,24 +444,6 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 await _syncMapboxAnnotations();
                 await _fitCameraToTargetsIfNeeded();
               }
-              if (userCoord == null && _simTimer == null) {
-                int i = 0;
-                _simTimer = Timer.periodic(const Duration(milliseconds: 700), (
-                  t,
-                ) async {
-                  if (i >= routePoints.length) {
-                    t.cancel();
-                    _simTimer = null;
-                    return;
-                  }
-                  setState(() {
-                    userCoord = routePoints[i];
-                  });
-                  i++;
-                  await _syncMapboxAnnotations();
-                  _updateCurrentStep();
-                });
-              }
               return true;
             }
           }
@@ -489,22 +475,6 @@ class _NavigationScreenState extends State<NavigationScreen> {
               });
               await _syncMapboxAnnotations();
               await _fitCameraToTargetsIfNeeded();
-              if (userCoord == null && _simTimer == null) {
-                int i = 0;
-                _simTimer = Timer.periodic(const Duration(milliseconds: 700), (
-                  t,
-                ) async {
-                  if (i >= routePoints.length) {
-                    t.cancel();
-                    _simTimer = null;
-                    return;
-                  }
-                  setState(() {
-                    userCoord = routePoints[i];
-                  });
-                  i++;
-                });
-              }
               return true;
             }
           }
@@ -720,6 +690,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                   now.difference(_lastSpeedTime!).inMilliseconds / 1000.0;
               if (dt > 0) kmh = (d / dt) * 3.6;
             }
+            final prevCoord = _lastSpeedCoord;
             _lastSpeedCoord = cur;
             _lastSpeedTime = now;
             setState(() {
@@ -727,34 +698,92 @@ class _NavigationScreenState extends State<NavigationScreen> {
               centerCoord = userCoord;
               if (kmh != null) _speedKmh = kmh;
             });
+            final shouldFollow = _started || ((_speedKmh ?? 0.0) > 0.5);
             if (_mapbox != null) {
-              double? brg;
-              if (_stepGeom.isNotEmpty) {
-                brg = _bearing(userCoord!, _stepGeom.last);
-              } else if (toCoord != null) {
-                brg = _bearing(userCoord!, toCoord!);
-              }
-              await _mapbox!.flyTo(
-                mapbox.CameraOptions(
-                  center: mapbox.Point(
-                    coordinates: mapbox.Position(
-                      userCoord!.longitude,
-                      userCoord!.latitude,
+              if (shouldFollow) {
+                double? targetBrg;
+                final gpsBrg = pos.heading;
+                if (gpsBrg.isFinite && gpsBrg >= 0) {
+                  targetBrg = gpsBrg;
+                } else if (_stepGeom.isNotEmpty) {
+                  targetBrg = _bearing(userCoord!, _stepGeom.last);
+                } else if (toCoord != null) {
+                  targetBrg = _bearing(userCoord!, toCoord!);
+                }
+                final moveMeters = prevCoord == null
+                    ? 9999.0
+                    : _distCalc.as(LengthUnit.Meter, prevCoord, cur);
+                final dtCam = _lastCamUpdate == null
+                    ? 9999
+                    : now.difference(_lastCamUpdate!).inMilliseconds;
+                if (moveMeters > 3.0 || dtCam > 500) {
+                  final targetBearing = targetBrg ?? _lastBearing ?? 0.0;
+                  double newBearing;
+                  if (_lastBearing == null) {
+                    newBearing = targetBearing;
+                  } else {
+                    var diff = targetBearing - _lastBearing!;
+                    while (diff > 180.0) diff -= 360.0;
+                    while (diff < -180.0) diff += 360.0;
+                    final step = diff.clamp(-10.0, 10.0);
+                    newBearing = _lastBearing! + step;
+                  }
+                  final zoom = _speedKmh == null
+                      ? 16.0
+                      : (_speedKmh! < 10
+                            ? 16.5
+                            : (_speedKmh! < 40 ? 15.5 : 15.0));
+                  await _mapbox!.flyTo(
+                    mapbox.CameraOptions(
+                      center: mapbox.Point(
+                        coordinates: mapbox.Position(
+                          userCoord!.longitude,
+                          userCoord!.latitude,
+                        ),
+                      ),
+                      zoom: zoom,
+                      pitch: 60,
+                      bearing: newBearing,
                     ),
-                  ),
-                  zoom: 16,
-                  pitch: 60,
-                  bearing: brg,
-                ),
-                mapbox.MapAnimationOptions(duration: 800, startDelay: 0),
-              );
-              _currentZoom = 16;
-              await _syncMapboxAnnotations();
-              if (_mapbox == null) {
-                mapController.move(userCoord!, 13);
+                    mapbox.MapAnimationOptions(duration: 500, startDelay: 0),
+                  );
+                  _currentZoom = zoom;
+                  _lastBearing = newBearing;
+                  _lastCamUpdate = now;
+                  if (_started) {
+                    await _recalcRouteFromUser();
+                    _updateCurrentStep();
+                  }
+                }
               }
-              await _recalcRouteFromUser();
-              _updateCurrentStep();
+              await _syncMapboxAnnotations();
+            } else {
+              if (shouldFollow) {
+                final moveMeters = prevCoord == null
+                    ? 9999.0
+                    : _distCalc.as(LengthUnit.Meter, prevCoord, cur);
+                final dtCam = _lastCamUpdate == null
+                    ? 9999
+                    : now.difference(_lastCamUpdate!).inMilliseconds;
+                if (moveMeters > 3.0 || dtCam > 500) {
+                  final gpsBrg = pos.heading;
+                  if (gpsBrg.isFinite && gpsBrg >= 0) {
+                    _lastBearing = gpsBrg;
+                  }
+                  final zoom = _speedKmh == null
+                      ? 16.0
+                      : (_speedKmh! < 10
+                            ? 16.5
+                            : (_speedKmh! < 40 ? 15.5 : 15.0));
+                  _currentZoom = zoom;
+                  mapController.move(userCoord!, _currentZoom);
+                  _lastCamUpdate = now;
+                  if (_started) {
+                    await _recalcRouteFromUser();
+                    _updateCurrentStep();
+                  }
+                }
+              }
             }
           });
     } catch (_) {}
@@ -876,526 +905,672 @@ class _NavigationScreenState extends State<NavigationScreen> {
   @override
   Widget build(BuildContext context) {
     final o = widget.order;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Navigation')),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: GestureDetector(
-              onTap: () => setState(() => showInfoOverlay = !showInfoOverlay),
-              child: DriverSession.mapboxToken.isNotEmpty
-                  ? mapbox.MapWidget(
-                      styleUri: 'mapbox://styles/mapbox/navigation-night-v1',
-                      cameraOptions: mapbox.CameraOptions(
-                        center: mapbox.Point(
-                          coordinates: mapbox.Position(
-                            (centerCoord ??
-                                    fromCoord ??
-                                    toCoord ??
-                                    const LatLng(-26.2041, 28.0473))
-                                .longitude,
-                            (centerCoord ??
-                                    fromCoord ??
-                                    toCoord ??
-                                    const LatLng(-26.2041, 28.0473))
-                                .latitude,
-                          ),
-                        ),
-                        zoom: 15,
-                        pitch: 55,
-                        bearing: 0,
-                      ),
-                      onMapCreated: (m) async {
-                        _mapbox = m;
-                        try {
-                          await _mapbox!.location.updateSettings(
-                            mapbox.LocationComponentSettings(
-                              enabled: true,
-                              puckBearingEnabled: true,
-                              puckBearing: mapbox.PuckBearing.COURSE,
-                              locationPuck: mapbox.LocationPuck(
-                                locationPuck3D: mapbox.LocationPuck3D(
-                                  modelUri:
-                                      'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CarConcept/glTF-Binary/CarConcept.glb',
-                                  modelScale: [1.0, 1.0, 1.0],
-                                  modelRotation: [0.0, 0.0, 0.0],
-                                ),
-                              ),
+    return WillPopScope(
+      onWillPop: () async {
+        Navigator.pop(context, {'started': _started});
+        return false;
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Navigation')),
+        body: Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                onTap: () => setState(() => showInfoOverlay = !showInfoOverlay),
+                child: DriverSession.mapboxToken.isNotEmpty
+                    ? mapbox.MapWidget(
+                        styleUri: 'mapbox://styles/mapbox/navigation-night-v1',
+                        cameraOptions: mapbox.CameraOptions(
+                          center: mapbox.Point(
+                            coordinates: mapbox.Position(
+                              (centerCoord ??
+                                      fromCoord ??
+                                      toCoord ??
+                                      const LatLng(-26.2041, 28.0473))
+                                  .longitude,
+                              (centerCoord ??
+                                      fromCoord ??
+                                      toCoord ??
+                                      const LatLng(-26.2041, 28.0473))
+                                  .latitude,
                             ),
-                          );
-                        } catch (_) {}
-                        await _syncMapboxAnnotations();
-                        try {
-                          await _mapbox!.style.addStyleLayer(
-                            '{"id":"3d-buildings","type":"fill-extrusion","source":"composite","source-layer":"building","filter":["==",["get","extrude"],"true"],"minzoom":15,"paint":{"fill-extrusion-color":"#aaa","fill-extrusion-height":["interpolate",["linear"],["zoom"],15,0,15.05,["get","height"]],"fill-extrusion-base":["interpolate",["linear"],["zoom"],15,0,15.05,["get","min_height"]],"fill-extrusion-opacity":0.6}}',
-                            null,
-                          );
-                          await _mapbox!.style.addStyleLayer(
-                            '{"id":"sky","type":"sky","paint":{"sky-type":"atmosphere","sky-atmosphere-sun-intensity":0.5}}',
-                            null,
-                          );
-                        } catch (_) {}
-                        if (widget.autoStart) {
-                          await _startNavigation();
-                        }
-                      },
-                    )
-                  : fmap.FlutterMap(
-                      mapController: mapController,
-                      options: fmap.MapOptions(
-                        initialCenter:
-                            centerCoord ??
-                            fromCoord ??
-                            toCoord ??
-                            const LatLng(-26.2041, 28.0473),
-                        initialZoom: 13,
-                      ),
-                      children: [
-                        fmap.TileLayer(
-                          urlTemplate:
-                              'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                        ),
-                        if (fromCoord != null || toCoord != null)
-                          fmap.MarkerLayer(
-                            markers: [
-                              if (fromCoord != null)
-                                fmap.Marker(
-                                  point: fromCoord!,
-                                  width: 40,
-                                  height: 40,
-                                  child: const Icon(
-                                    Icons.location_on,
-                                    color: Colors.lightBlueAccent,
-                                    size: 36,
-                                  ),
-                                ),
-                              if (toCoord != null)
-                                fmap.Marker(
-                                  point: toCoord!,
-                                  width: 40,
-                                  height: 40,
-                                  child: const Icon(
-                                    Icons.flag,
-                                    color: Colors.redAccent,
-                                    size: 32,
-                                  ),
-                                ),
-                              if (userCoord != null)
-                                fmap.Marker(
-                                  point: userCoord!,
-                                  width: 36,
-                                  height: 36,
-                                  child: const Icon(
-                                    Icons.person_pin_circle,
-                                    color: Colors.greenAccent,
-                                    size: 32,
-                                  ),
-                                ),
-                            ],
                           ),
-                        if (routePoints.isNotEmpty)
-                          fmap.PolylineLayer(
-                            polylines: [
-                              fmap.Polyline(
-                                points: routePoints,
-                                color: Colors.blue,
-                                strokeWidth: 6,
+                          zoom: 15,
+                          pitch: 55,
+                          bearing: 0,
+                        ),
+                        onMapCreated: (m) async {
+                          _mapbox = m;
+                          try {
+                            await _mapbox!.location.updateSettings(
+                              mapbox.LocationComponentSettings(
+                                enabled: true,
+                                puckBearingEnabled: true,
+                                puckBearing: mapbox.PuckBearing.COURSE,
+                                locationPuck: mapbox.LocationPuck(
+                                  locationPuck3D: mapbox.LocationPuck3D(
+                                    modelUri:
+                                        'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CarConcept/glTF-Binary/CarConcept.glb',
+                                    modelScale: [1.0, 1.0, 1.0],
+                                    modelRotation: [0.0, 0.0, 0.0],
+                                  ),
+                                ),
                               ),
-                            ],
+                            );
+                          } catch (_) {}
+                          await _syncMapboxAnnotations();
+                          try {
+                            await _mapbox!.style.addStyleLayer(
+                              '{"id":"3d-buildings","type":"fill-extrusion","source":"composite","source-layer":"building","filter":["==",["get","extrude"],"true"],"minzoom":15,"paint":{"fill-extrusion-color":"#aaa","fill-extrusion-height":["interpolate",["linear"],["zoom"],15,0,15.05,["get","height"]],"fill-extrusion-base":["interpolate",["linear"],["zoom"],15,0,15.05,["get","min_height"]],"fill-extrusion-opacity":0.6}}',
+                              null,
+                            );
+                            await _mapbox!.style.addStyleLayer(
+                              '{"id":"sky","type":"sky","paint":{"sky-type":"atmosphere","sky-atmosphere-sun-intensity":0.5}}',
+                              null,
+                            );
+                          } catch (_) {}
+                          if (widget.autoStart) {
+                            await _startNavigation();
+                          }
+                        },
+                      )
+                    : fmap.FlutterMap(
+                        mapController: mapController,
+                        options: fmap.MapOptions(
+                          initialCenter:
+                              centerCoord ??
+                              fromCoord ??
+                              toCoord ??
+                              const LatLng(-26.2041, 28.0473),
+                          initialZoom: 13,
+                        ),
+                        children: [
+                          fmap.TileLayer(
+                            urlTemplate:
+                                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          ),
+                          if (fromCoord != null || toCoord != null)
+                            fmap.MarkerLayer(
+                              markers: [
+                                if (fromCoord != null)
+                                  fmap.Marker(
+                                    point: fromCoord!,
+                                    width: 40,
+                                    height: 40,
+                                    child: const Icon(
+                                      Icons.location_on,
+                                      color: Colors.lightBlueAccent,
+                                      size: 36,
+                                    ),
+                                  ),
+                                if (toCoord != null)
+                                  fmap.Marker(
+                                    point: toCoord!,
+                                    width: 40,
+                                    height: 40,
+                                    child: const Icon(
+                                      Icons.flag,
+                                      color: Colors.redAccent,
+                                      size: 32,
+                                    ),
+                                  ),
+                                if (userCoord != null)
+                                  fmap.Marker(
+                                    point: userCoord!,
+                                    width: 40,
+                                    height: 40,
+                                    child: Transform.rotate(
+                                      angle:
+                                          ((_lastBearing ?? 0.0) * math.pi) /
+                                          180.0,
+                                      child: const Icon(
+                                        Icons.directions_car,
+                                        color: Colors.orangeAccent,
+                                        size: 34,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          if (routePoints.isNotEmpty)
+                            fmap.PolylineLayer(
+                              polylines: [
+                                fmap.Polyline(
+                                  points: routePoints,
+                                  color: Colors.blue,
+                                  strokeWidth: 6,
+                                ),
+                              ],
+                            ),
+                        ],
+                      ),
+              ),
+            ),
+            if (loading)
+              const Positioned.fill(
+                child: Center(
+                  child: CircularProgressIndicator(color: Colors.white70),
+                ),
+              ),
+            Positioned(
+              top: 12,
+              left: 12,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child: _stepName == null
+                    ? const SizedBox.shrink()
+                    : Container(
+                        key: ValueKey(
+                          _stepIndex.toString() + (_stepName ?? ''),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.85),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _turnIconFor(_stepType, _stepModifier),
+                              color: Colors.white,
+                              size: 24,
+                            ),
+                            const SizedBox(width: 10),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Builder(
+                                  builder: (_) {
+                                    final d = _nextTurnDistanceMiles();
+                                    if (d == null)
+                                      return const SizedBox.shrink();
+                                    return Text(
+                                      d.toStringAsFixed(1) + ' mi',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    );
+                                  },
+                                ),
+                                Text(
+                                  _stepName ?? '-',
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Builder(
+                                  builder: (_) {
+                                    final icons = <Widget>[];
+                                    final end = (_stepIndex + 4) < _steps.length
+                                        ? _stepIndex + 4
+                                        : _steps.length - 1;
+                                    for (
+                                      int i = _stepIndex + 1;
+                                      i <= end;
+                                      i++
+                                    ) {
+                                      final s = _steps[i];
+                                      icons.add(
+                                        Icon(
+                                          _turnIconFor(s.type, s.modifier),
+                                          color: Colors.white70,
+                                          size: 18,
+                                        ),
+                                      );
+                                      if (i < end)
+                                        icons.add(const SizedBox(width: 6));
+                                    }
+                                    if (icons.isEmpty)
+                                      return const SizedBox.shrink();
+                                    return Row(children: icons);
+                                  },
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+              ),
+            ),
+            if (routeFare != null)
+              Positioned(
+                top: 12,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.7),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      'R ' + routeFare!.toStringAsFixed(2),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              top: 12,
+              left: 12,
+              child: Builder(
+                builder: (_) {
+                  final miles = _nextTurnDistanceMiles();
+                  final step = _stepName;
+                  if (miles == null && (step == null || step.isEmpty)) {
+                    return const SizedBox.shrink();
+                  }
+                  final icons = <Widget>[];
+                  final type = _stepType ?? '';
+                  final mod = _stepModifier ?? '';
+                  icons.add(
+                    Icon(
+                      _turnIconFor(type, mod),
+                      color: Colors.white,
+                      size: 18,
+                    ),
+                  );
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.85),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ...icons,
+                        const SizedBox(width: 8),
+                        if (miles != null)
+                          Text(
+                            miles.toStringAsFixed(1) + ' mi',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        const SizedBox(width: 8),
+                        if (step != null && step.isNotEmpty)
+                          Text(
+                            step,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
                       ],
                     ),
-            ),
-          ),
-          if (loading)
-            const Positioned.fill(
-              child: Center(
-                child: CircularProgressIndicator(color: Colors.white70),
+                  );
+                },
               ),
             ),
-          Positioned(
-            top: 12,
-            left: 12,
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 200),
-              child: _stepName == null
-                  ? const SizedBox.shrink()
-                  : Container(
-                      key: ValueKey(_stepIndex.toString() + (_stepName ?? '')),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.85),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _turnIconFor(_stepType, _stepModifier),
-                            color: Colors.white,
-                            size: 24,
-                          ),
-                          const SizedBox(width: 10),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Builder(
-                                builder: (_) {
-                                  final d = _nextTurnDistanceMiles();
-                                  if (d == null) return const SizedBox.shrink();
-                                  return Text(
-                                    d.toStringAsFixed(1) + ' mi',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  );
-                                },
-                              ),
-                              Text(
-                                _stepName ?? '-',
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Builder(
-                                builder: (_) {
-                                  final icons = <Widget>[];
-                                  final end = (_stepIndex + 4) < _steps.length
-                                      ? _stepIndex + 4
-                                      : _steps.length - 1;
-                                  for (int i = _stepIndex + 1; i <= end; i++) {
-                                    final s = _steps[i];
-                                    icons.add(
-                                      Icon(
-                                        _turnIconFor(s.type, s.modifier),
-                                        color: Colors.white70,
-                                        size: 18,
-                                      ),
-                                    );
-                                    if (i < end)
-                                      icons.add(const SizedBox(width: 6));
-                                  }
-                                  if (icons.isEmpty)
-                                    return const SizedBox.shrink();
-                                  return Row(children: icons);
-                                },
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-            ),
-          ),
-          if (routeFare != null)
-            Positioned(
-              top: 12,
-              left: 0,
-              right: 0,
-              child: Center(
+            if (error != null)
+              Positioned(
+                top: 64,
+                left: 16,
+                right: 16,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
+                  padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.7),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Text(
-                    'R ' + routeFare!.toStringAsFixed(2),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          Positioned(
-            top: 12,
-            left: 12,
-            child: Builder(
-              builder: (_) {
-                final miles = _nextTurnDistanceMiles();
-                final step = _stepName;
-                if (miles == null && (step == null || step.isEmpty)) {
-                  return const SizedBox.shrink();
-                }
-                final icons = <Widget>[];
-                final type = _stepType ?? '';
-                final mod = _stepModifier ?? '';
-                icons.add(
-                  Icon(_turnIconFor(type, mod), color: Colors.white, size: 18),
-                );
-                return Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.85),
-                    borderRadius: BorderRadius.circular(10),
+                    color: Colors.red.withOpacity(0.08),
+                    border: Border.all(color: Colors.redAccent),
+                    borderRadius: BorderRadius.circular(8),
                   ),
                   child: Row(
-                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      ...icons,
+                      const Icon(Icons.error_outline, color: Colors.redAccent),
                       const SizedBox(width: 8),
-                      if (miles != null)
-                        Text(
-                          miles.toStringAsFixed(1) + ' mi',
+                      Expanded(
+                        child: Text(
+                          error!,
                           style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      const SizedBox(width: 8),
-                      if (step != null && step.isNotEmpty)
-                        Text(
-                          step,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
+                            color: Colors.redAccent,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
+                      ),
                     ],
                   ),
-                );
-              },
-            ),
-          ),
-          if (error != null)
-            Positioned(
-              top: 64,
-              left: 16,
-              right: 16,
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.red.withOpacity(0.08),
-                  border: Border.all(color: Colors.redAccent),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.redAccent),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        error!,
-                        style: const TextStyle(
-                          color: Colors.redAccent,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
                 ),
               ),
-            ),
-          Positioned(
-            bottom: 0,
-            left: 0,
-            right: 0,
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 200),
-              child: !showInfoOverlay
-                  ? const SizedBox.shrink()
-                  : Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.9),
-                        borderRadius: const BorderRadius.only(
-                          topLeft: Radius.circular(16),
-                          topRight: Radius.circular(16),
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child: !showInfoOverlay
+                    ? const SizedBox.shrink()
+                    : Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.9),
+                          borderRadius: const BorderRadius.only(
+                            topLeft: Radius.circular(16),
+                            topRight: Radius.circular(16),
+                          ),
                         ),
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (o != null)
-                            Text(
-                              'Customer: ' + _clean(o.customerName),
-                              style: const TextStyle(color: Colors.white),
-                            ),
-                          Text(
-                            'From: ${o != null ? _clean(o.pickupAddress) : '-'}',
-                            style: const TextStyle(color: Colors.white70),
-                          ),
-                          Text(
-                            'To:   ${o != null ? _clean(o.deliveryAddress) : '-'}',
-                            style: const TextStyle(color: Colors.white70),
-                          ),
-                          const SizedBox(height: 6),
-                          Builder(
-                            builder: (_) {
-                              final dist = routeDistanceKm ?? o?.distanceKm;
-                              if (dist == null) return const SizedBox.shrink();
-                              return Text(
-                                'Distance: ' + dist.toStringAsFixed(1) + ' km',
-                                style: const TextStyle(color: Colors.white70),
-                              );
-                            },
-                          ),
-                          Builder(
-                            builder: (_) {
-                              if (userCoord == null)
-                                return const SizedBox.shrink();
-                              final stage = navToPickup
-                                  ? 'To Pickup'
-                                  : 'To Dropoff';
-                              return Text(
-                                'Stage: ' + stage,
-                                style: const TextStyle(color: Colors.white70),
-                              );
-                            },
-                          ),
-                          if (routeFare != null)
-                            Text(
-                              'Cost: R ' + routeFare!.toStringAsFixed(2),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (o != null)
+                              Text(
+                                'Customer: ' + _clean(o.customerName),
+                                style: const TextStyle(color: Colors.white),
                               ),
-                            ),
-                          if (o != null)
                             Text(
-                              'Offer: R ' + o.payout.toStringAsFixed(2),
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontWeight: FontWeight.w500,
-                              ),
+                              'From: ${o != null ? _clean(o.pickupAddress) : '-'}',
+                              style: const TextStyle(color: Colors.white70),
                             ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton(
-                                  onPressed: widget.autoStart
-                                      ? null
-                                      : () async {
+                            Text(
+                              'To:   ${o != null ? _clean(o.deliveryAddress) : '-'}',
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            const SizedBox(height: 6),
+                            Builder(
+                              builder: (_) {
+                                final dist = routeDistanceKm ?? o?.distanceKm;
+                                if (dist == null)
+                                  return const SizedBox.shrink();
+                                return Text(
+                                  'Distance: ' +
+                                      dist.toStringAsFixed(1) +
+                                      ' km',
+                                  style: const TextStyle(color: Colors.white70),
+                                );
+                              },
+                            ),
+                            Builder(
+                              builder: (_) {
+                                if (userCoord == null)
+                                  return const SizedBox.shrink();
+                                final stage = navToPickup
+                                    ? 'To Pickup'
+                                    : 'To Dropoff';
+                                return Text(
+                                  'Stage: ' + stage,
+                                  style: const TextStyle(color: Colors.white70),
+                                );
+                              },
+                            ),
+                            if (routeFare != null)
+                              Text(
+                                'Cost: R ' + routeFare!.toStringAsFixed(2),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            if (o != null)
+                              Text(
+                                'Offer: R ' + o.payout.toStringAsFixed(2),
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            const SizedBox(height: 12),
+                            LayoutBuilder(
+                              builder: (context, constraints) {
+                                final w = constraints.maxWidth;
+                                final btnW = w >= 560
+                                    ? (w - 36) / 4
+                                    : (w - 12) / 2;
+                                return Wrap(
+                                  spacing: 12,
+                                  runSpacing: 8,
+                                  children: [
+                                    SizedBox(
+                                      width: btnW,
+                                      child: ElevatedButton(
+                                        onPressed: widget.autoStart
+                                            ? null
+                                            : () async {
+                                                if (o != null) {
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    const SnackBar(
+                                                      content: Text(
+                                                        'Starting navigation...',
+                                                      ),
+                                                    ),
+                                                  );
+                                                  await _startNavigation();
+                                                }
+                                              },
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            const Icon(
+                                              Icons.navigation,
+                                              size: 18,
+                                            ),
+                                            const SizedBox(width: 6),
+                                            Text(
+                                              widget.autoStart
+                                                  ? 'Started'
+                                                  : 'Start',
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                    SizedBox(
+                                      width: btnW,
+                                      child: ElevatedButton(
+                                        onPressed: () async {
+                                          if (o != null) {
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).hideCurrentSnackBar();
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              const SnackBar(
+                                                content: Text(
+                                                  'Cancelling delivery...',
+                                                ),
+                                              ),
+                                            );
+                                            final ok =
+                                                await ApiClient.updateOrderStatus(
+                                                  o.id,
+                                                  'awaiting',
+                                                  action: 'update_status',
+                                                );
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).hideCurrentSnackBar();
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              SnackBar(
+                                                content: Text(
+                                                  ok
+                                                      ? 'Order returned to awaiting'
+                                                      : 'Failed to cancel delivery',
+                                                ),
+                                              ),
+                                            );
+                                          }
+                                          if (mounted)
+                                            Navigator.pop(context, {
+                                              'started': _started,
+                                            });
+                                        },
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: const [
+                                            Icon(
+                                              Icons.cancel_outlined,
+                                              size: 18,
+                                            ),
+                                            SizedBox(width: 6),
+                                            Text('Cancel'),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                    SizedBox(
+                                      width: btnW,
+                                      child: ElevatedButton(
+                                        onPressed: () async {
+                                          if (o != null) {
+                                            String phone =
+                                                (o.customerPhone ?? '').trim();
+                                            if (phone.isEmpty) {
+                                              final fetched =
+                                                  await ApiClient.fetchOrderDetailsFromOrdersPage(
+                                                    o.id,
+                                                  );
+                                              if (fetched
+                                                      ?.customerPhone
+                                                      ?.isNotEmpty ==
+                                                  true) {
+                                                phone = fetched!.customerPhone!;
+                                              }
+                                            }
+                                            if (phone.isEmpty) {
+                                              ScaffoldMessenger.of(
+                                                context,
+                                              ).showSnackBar(
+                                                const SnackBar(
+                                                  content: Text(
+                                                    'No customer phone',
+                                                  ),
+                                                ),
+                                              );
+                                              return;
+                                            }
+                                            final uri = Uri.parse(
+                                              'tel:' + phone,
+                                            );
+                                            try {
+                                              await launchUrl(
+                                                uri,
+                                                mode: LaunchMode
+                                                    .externalApplication,
+                                              );
+                                            } catch (_) {
+                                              ScaffoldMessenger.of(
+                                                context,
+                                              ).showSnackBar(
+                                                const SnackBar(
+                                                  content: Text(
+                                                    'Unable to open dialer',
+                                                  ),
+                                                ),
+                                              );
+                                            }
+                                          }
+                                        },
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: const [
+                                            Icon(
+                                              Icons.phone_outlined,
+                                              size: 18,
+                                            ),
+                                            SizedBox(width: 6),
+                                            Text('Call'),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                    SizedBox(
+                                      width: btnW,
+                                      child: ElevatedButton(
+                                        onPressed: () async {
                                           if (o != null) {
                                             ScaffoldMessenger.of(
                                               context,
                                             ).showSnackBar(
                                               const SnackBar(
                                                 content: Text(
-                                                  'Starting navigation...',
+                                                  'Marking delivered...',
                                                 ),
                                               ),
                                             );
-                                            await _startNavigation();
+                                            final ok =
+                                                await ApiClient.updateOrderStatus(
+                                                  o.id,
+                                                  'delivered',
+                                                  action: 'update_status',
+                                                  extra: {
+                                                    'driver_delivery_time':
+                                                        ApiClient.nowTs(),
+                                                    if (routeFare != null)
+                                                      'delivery_fee': routeFare,
+                                                  },
+                                                );
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).hideCurrentSnackBar();
+                                            ScaffoldMessenger.of(
+                                              context,
+                                            ).showSnackBar(
+                                              SnackBar(
+                                                content: Text(
+                                                  ok
+                                                      ? 'Delivery marked as complete'
+                                                      : 'Failed to update delivery',
+                                                ),
+                                              ),
+                                            );
+                                            if (ok && mounted)
+                                              Navigator.pop(context, {
+                                                'started': _started,
+                                              });
                                           }
                                         },
-                                  child: Text(
-                                    widget.autoStart ? 'Started' : 'Start',
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: ElevatedButton(
-                                  onPressed: () async {
-                                    if (o != null) {
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).hideCurrentSnackBar();
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Cancelling delivery...',
-                                          ),
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: const [
+                                            Icon(
+                                              Icons.check_circle_outline,
+                                              size: 18,
+                                            ),
+                                            SizedBox(width: 6),
+                                            Text('Delivered'),
+                                          ],
                                         ),
-                                      );
-                                      final ok =
-                                          await ApiClient.updateOrderStatus(
-                                            o.id,
-                                            'awaiting',
-                                            action: 'update_status',
-                                          );
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).hideCurrentSnackBar();
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        SnackBar(
-                                          content: Text(
-                                            ok
-                                                ? 'Order returned to awaiting'
-                                                : 'Failed to cancel delivery',
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                    if (mounted) Navigator.pop(context);
-                                  },
-                                  child: const Text('Cancel'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: ElevatedButton(
-                                  onPressed: () async {
-                                    if (o != null) {
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        const SnackBar(
-                                          content: Text('Marking delivered...'),
-                                        ),
-                                      );
-                                      final ok =
-                                          await ApiClient.updateOrderStatus(
-                                            o.id,
-                                            'delivered',
-                                            action: 'update_status',
-                                            extra: {
-                                              'driver_delivery_time':
-                                                  ApiClient.nowTs(),
-                                              if (routeFare != null)
-                                                'delivery_fee': routeFare,
-                                            },
-                                          );
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).hideCurrentSnackBar();
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        SnackBar(
-                                          content: Text(
-                                            ok
-                                                ? 'Delivery marked as complete'
-                                                : 'Failed to update delivery',
-                                          ),
-                                        ),
-                                      );
-                                      if (ok && mounted) Navigator.pop(context);
-                                    }
-                                  },
-                                  child: const Text('Delivered'),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
+                                      ),
+                                    ),
+                                  ],
+                                );
+                              },
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
