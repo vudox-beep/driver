@@ -24,9 +24,10 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   bool available = true;
-  String filter = 'all';
+  String filter = 'nearby';
   bool notificationsEnabled = true;
   final orders = <Order>[];
+  final _myOrders = <Order>[];
   bool loadingOrders = false;
   String? ordersError;
   LatLng? _driverCoord;
@@ -41,15 +42,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ordersError = null;
     });
     try {
-      final parsed = await ApiClient.fetchAvailableOrders();
+      final avail = await ApiClient.fetchAvailableOrders();
+      final mine = await ApiClient.fetchMyOrders();
       await _ensureLocation();
+      final nearbyAvail = _applyDistanceFilter(
+        avail.where((o) {
+          final s = o.status.toLowerCase();
+          return s == 'awaiting' || s == 'confirmed';
+        }).toList(),
+      );
+      final mineWithDist = _applyDistanceFilter(mine);
       setState(() {
-        if (parsed.isNotEmpty) {
-          orders
-            ..clear()
-            ..addAll(_applyDistanceFilter(parsed));
-        } else {
-          ordersError = 'Failed to load orders';
+        _myOrders
+          ..clear()
+          ..addAll(mineWithDist);
+        final combined = <Order>[]
+          ..addAll(_myOrders)
+          ..addAll(nearbyAvail);
+        orders
+          ..clear()
+          ..addAll(combined);
+        if (combined.isEmpty) {
+          ordersError = 'No orders found';
         }
       });
     } catch (_) {
@@ -105,7 +119,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
       return o;
     }).toList();
-    final nearby = withDist.where((o) => (o.distanceKm ?? 999) <= 7.0).toList();
+    final nearby = withDist.where((o) => (o.distanceKm ?? 999) <= 8.0).toList();
     return nearby.isNotEmpty ? nearby : withDist;
   }
 
@@ -127,11 +141,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
   List<Order> get filteredOrders {
     switch (filter) {
       case 'active':
-        return orders.where((o) => o.status != 'delivered').toList();
+        final mineActive = _myOrders
+            .where((o) => o.status != 'delivered')
+            .toList();
+        return mineActive.isNotEmpty
+            ? mineActive
+            : orders.where((o) => o.status != 'delivered').toList();
       case 'delivered':
-        return orders.where((o) => o.status == 'delivered').toList();
+        final mineDelivered = _myOrders
+            .where((o) => o.status == 'delivered')
+            .toList();
+        return mineDelivered.isNotEmpty
+            ? mineDelivered
+            : orders.where((o) => o.status == 'delivered').toList();
       case 'nearby':
-        final n = orders.where((o) => (o.distanceKm ?? 999) <= 7.0).toList();
+        final n = orders.where((o) => (o.distanceKm ?? 999) <= 8.0).toList();
         return n.isNotEmpty ? n : orders;
       default:
         return orders;
@@ -286,10 +310,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       const SizedBox(width: 6),
                       IconButton(
                         onPressed: () async {
-                          setState(() => available = !available);
+                          final target = !available;
+                          setState(() => available = target);
+                          bool ok = false;
                           try {
-                            await ApiClient.updateDriverAvailability(available);
+                            ok = await ApiClient.updateDriverAvailability(
+                              target,
+                            );
                           } catch (_) {}
+                          if (!ok) {
+                            setState(() => available = !target);
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Failed to update availability'),
+                              ),
+                            );
+                          }
                         },
                         icon: Icon(
                           available ? Icons.toggle_on : Icons.toggle_off,
@@ -668,6 +704,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                           SnackBar(content: Text(err)),
                                         );
                                       }
+                                    } catch (_) {}
+                                    try {
+                                      await fetchOrders();
                                     } catch (_) {}
                                   },
                                   child: const Text('Accept'),
