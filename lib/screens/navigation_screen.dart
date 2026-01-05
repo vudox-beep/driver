@@ -11,6 +11,9 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:geolocator/geolocator.dart';
 import 'dart:math' as math;
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart' as gmap;
+import 'dart:ui' as ui;
 
 class _PointClick implements mapbox.OnPointAnnotationClickListener {
   final void Function(mapbox.PointAnnotation) onClick;
@@ -39,12 +42,14 @@ class _NavigationScreenState extends State<NavigationScreen> {
   LatLng? centerCoord;
   final mapController = fmap.MapController();
   mapbox.MapboxMap? _mapbox;
+  gmap.GoogleMapController? _gmap;
   mapbox.PointAnnotationManager? _pointManager;
   mapbox.PolylineAnnotationManager? _polylineManager;
   _PointClick? _tapListener;
   List<LatLng> routePoints = const [];
   double? routeDistanceKm;
   double? routeFare;
+  double? routeEtaMinutes;
   static const double _ratePerKm = 5.0;
   LatLng? userCoord;
   String? userAddress;
@@ -53,7 +58,10 @@ class _NavigationScreenState extends State<NavigationScreen> {
   final Distance _distCalc = const Distance();
   Timer? _simTimer;
   bool showInfoOverlay = false;
+  gmap.BitmapDescriptor? _carIcon;
   bool _didInitialFit = false;
+  bool _deliveredDone = false;
+  bool _didScheduleAutoStart = false;
   List<_NavStep> _steps = const [];
   int _stepIndex = 0;
   String? _stepName;
@@ -64,11 +72,30 @@ class _NavigationScreenState extends State<NavigationScreen> {
   bool _started = false;
   DateTime? _lastCamUpdate;
   double? _lastBearing;
+  bool _fareLocked = false;
+  double? _fareFixed;
+  LatLng? _displayCoord;
+  LatLng? _snappedCoord;
   double _kmToMiles(double km) => km * 0.621371;
   double? _speedKmh;
   LatLng? _lastSpeedCoord;
   DateTime? _lastSpeedTime;
-  double _currentZoom = 15.0;
+  static const double _fixedZoom = 16.5;
+  double _currentZoom = _fixedZoom;
+  double? _pickupDistMeters;
+  bool _pickupApproachSpoken = false;
+  static const String _googleDarkStyleJson =
+      '[{"elementType":"geometry","stylers":[{"color":"#1d2c4d"}]},{"elementType":"labels.text.fill","stylers":[{"color":"#8ec3b9"}]},{"elementType":"labels.text.stroke","stylers":[{"color":"#1a3646"}]},{"featureType":"administrative.country","elementType":"geometry.stroke","stylers":[{"color":"#4b6878"}]},{"featureType":"administrative.land_parcel","elementType":"labels.text.fill","stylers":[{"color":"#64779e"}]},{"featureType":"administrative.province","elementType":"geometry.stroke","stylers":[{"color":"#4b6878"}]},{"featureType":"landscape.man_made","elementType":"geometry.stroke","stylers":[{"color":"#334e87"}]},{"featureType":"poi","elementType":"labels.text.fill","stylers":[{"color":"#6f9ba5"}]},{"featureType":"poi.park","elementType":"geometry.fill","stylers":[{"color":"#023e58"}]},{"featureType":"poi.park","elementType":"labels.text.fill","stylers":[{"color":"#3C7680"}]},{"featureType":"road","elementType":"geometry","stylers":[{"color":"#304a7d"}]},{"featureType":"road","elementType":"labels.text.fill","stylers":[{"color":"#98a5be"}]},{"featureType":"road","elementType":"labels.text.stroke","stylers":[{"color":"#1d2c4d"}]},{"featureType":"road.highway","elementType":"geometry","stylers":[{"color":"#2c6675"}]},{"featureType":"road.highway","elementType":"geometry.stroke","stylers":[{"color":"#255763"}]},{"featureType":"road.highway","elementType":"labels.text.fill","stylers":[{"color":"#b0d5ce"}]},{"featureType":"road.highway","elementType":"labels.text.stroke","stylers":[{"color":"#023e58"}]},{"featureType":"transit","elementType":"labels.text.fill","stylers":[{"color":"#98a5be"}]},{"featureType":"transit","elementType":"labels.text.stroke","stylers":[{"color":"#1d2c4d"}]},{"featureType":"transit.line","elementType":"geometry","stylers":[{"color":"#1a3646"}]},{"featureType":"transit.station","elementType":"geometry","stylers":[{"color":"#1f2835"}]},{"featureType":"water","elementType":"geometry","stylers":[{"color":"#0e1626"}]},{"featureType":"water","elementType":"labels.text.fill","stylers":[{"color":"#4e6d70"}]}]';
+
+  double _smoothZoom(double target) {
+    final z = _currentZoom + (target - _currentZoom) * 0.15;
+    return z.clamp(3.0, 20.0);
+  }
+
+  FlutterTts? _tts;
+  bool _voiceEnabled = false;
+  int? _spokenStepIndex;
+  int? _approachSpokenIndex;
 
   void _onPointAnnotationTap(mapbox.PointAnnotation ann) {
     final o = widget.order;
@@ -89,28 +116,77 @@ class _NavigationScreenState extends State<NavigationScreen> {
     showDialog(
       context: context,
       builder: (_) {
-        return AlertDialog(
-          title: Text(title),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (cust.isNotEmpty) Text('Customer: ' + cust),
-              if (address.isNotEmpty) Text('Address: ' + address),
-              if (routeDistanceKm != null)
-                Text(
-                  'Distance: ' + routeDistanceKm!.toStringAsFixed(1) + ' km',
+        final cost =
+            _fareFixed ??
+            routeFare ??
+            ((o?.payout ?? 0.0) > 0 ? o!.payout : null);
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(16),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: BackdropFilter(
+              filter: ui.ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                color: Colors.black.withOpacity(0.78),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    if (cust.isNotEmpty)
+                      Text(
+                        'Customer: ' + cust,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    if (address.isNotEmpty)
+                      Text(
+                        'Address: ' + address,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    if (routeDistanceKm != null)
+                      Text(
+                        'Distance: ' +
+                            routeDistanceKm!.toStringAsFixed(1) +
+                            ' km',
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    if (cost != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          'Cost: R ' + cost.toStringAsFixed(2),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text(
+                          'Close',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              if (routeFare != null)
-                Text('Cost: R ' + routeFare!.toStringAsFixed(2)),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Close'),
+              ),
             ),
-          ],
+          ),
         );
       },
     );
@@ -157,10 +233,12 @@ class _NavigationScreenState extends State<NavigationScreen> {
           _stepModifier = ns.modifier;
           _stepGeom = ns.geom;
         });
+        _maybeSpeakTurn();
       } else {
         setState(() {
           _stepDistMeters = d;
         });
+        _maybeSpeakApproach();
       }
     }
   }
@@ -182,9 +260,59 @@ class _NavigationScreenState extends State<NavigationScreen> {
   @override
   void initState() {
     super.initState();
+    AppMeta.ensureGoogleApiKeyLoaded();
     _ensureLocation();
     _startPositionStream();
     _load();
+    _initTts();
+    _buildCarIcon();
+  }
+
+  Future<void> _buildCarIcon() async {
+    try {
+      final size = 96.0;
+      final recorder = ui.PictureRecorder();
+      final canvas = ui.Canvas(recorder, ui.Rect.fromLTWH(0, 0, size, size));
+      final body = ui.Paint()..color = const Color(0xFFFF9800);
+      final dark = ui.Paint()..color = const Color(0xFF212121);
+      final glass = ui.Paint()..color = const Color(0xFF90CAF9);
+      final accent = ui.Paint()..color = const Color(0xFFE65100);
+      final w = size;
+      final h = size;
+      final bx = w * 0.22;
+      final by = h * 0.56;
+      final bw = w * 0.56;
+      final bh = h * 0.22;
+      canvas.drawRRect(
+        ui.RRect.fromRectAndRadius(
+          ui.Rect.fromLTWH(bx, by, bw, bh),
+          ui.Radius.circular(h * 0.08),
+        ),
+        body,
+      );
+      final roof = ui.Path();
+      roof.moveTo(w * 0.30, h * 0.56);
+      roof.lineTo(w * 0.40, h * 0.46);
+      roof.lineTo(w * 0.60, h * 0.46);
+      roof.lineTo(w * 0.68, h * 0.56);
+      roof.close();
+      canvas.drawPath(roof, glass);
+      final nose = ui.Path();
+      nose.moveTo(w * 0.78, h * 0.60);
+      nose.lineTo(w * 0.78, h * 0.74);
+      nose.lineTo(w * 0.88, h * 0.67);
+      nose.close();
+      canvas.drawPath(nose, accent);
+      canvas.drawCircle(ui.Offset(w * 0.34, h * 0.80), h * 0.06, dark);
+      canvas.drawCircle(ui.Offset(w * 0.66, h * 0.80), h * 0.06, dark);
+      final pic = recorder.endRecording();
+      final img = await pic.toImage(size.toInt(), size.toInt());
+      final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (bytes != null) {
+        final d = gmap.BitmapDescriptor.fromBytes(bytes.buffer.asUint8List());
+        setState(() => _carIcon = d);
+      }
+    } catch (_) {}
   }
 
   Future<void> _load() async {
@@ -234,6 +362,121 @@ class _NavigationScreenState extends State<NavigationScreen> {
     }
   }
 
+  Future<void> _initTts() async {
+    try {
+      _tts = FlutterTts();
+      await _tts!.setLanguage('en-US');
+      await _tts!.setPitch(1.0);
+      await _tts!.setSpeechRate(0.5);
+      try {
+        await _pickPleasantVoice();
+      } catch (_) {}
+    } catch (_) {}
+  }
+
+  Future<void> _speak(String text) async {
+    if (_tts == null || !_voiceEnabled) return;
+    try {
+      await _tts!.speak(text);
+    } catch (_) {}
+  }
+
+  Future<void> _pickPleasantVoice() async {
+    if (_tts == null) return;
+    try {
+      final voices = await _tts!.getVoices;
+      List<Map<String, dynamic>> list = [];
+      if (voices is List) {
+        for (final v in voices) {
+          if (v is Map) {
+            list.add(v.map((k, val) => MapEntry(k.toString(), val)));
+          }
+        }
+      }
+      Map<String, dynamic>? chosen;
+      for (final v in list) {
+        final name = (v['name'] ?? '').toString().toLowerCase();
+        final loc = (v['locale'] ?? '').toString().toLowerCase();
+        if (loc.startsWith('en-us') && name.contains('female')) {
+          chosen = v;
+          break;
+        }
+      }
+      chosen ??= list.firstWhere((v) {
+        final name = (v['name'] ?? '').toString().toLowerCase();
+        final loc = (v['locale'] ?? '').toString().toLowerCase();
+        return loc.startsWith('en-gb') && name.contains('female');
+      }, orElse: () => {});
+      if ((chosen ?? {}).isEmpty) {
+        chosen = list.firstWhere(
+          (v) =>
+              ((v['locale'] ?? '').toString().toLowerCase()).startsWith('en'),
+          orElse: () => (list.isNotEmpty ? list.first : {}),
+        );
+      }
+      final name = (chosen?['name'] ?? '').toString();
+      final locale = (chosen?['locale'] ?? '').toString();
+      if (name.isNotEmpty && locale.isNotEmpty) {
+        await _tts!.setVoice({'name': name, 'locale': locale});
+      }
+      try {
+        await _tts!.setPitch(1.05);
+      } catch (_) {}
+      try {
+        await _tts!.setSpeechRate(0.46);
+      } catch (_) {}
+    } catch (_) {}
+  }
+
+  String _formatInstruction(String? type, String? modifier, String name) {
+    final t = (type ?? '').toLowerCase();
+    final m = (modifier ?? '').toLowerCase();
+    final n = name.trim();
+    if (t == 'arrive') return 'Arrive at destination';
+    if (t == 'depart') return 'Head to pickup';
+    if (t == 'continue')
+      return 'Continue straight' + (n.isNotEmpty ? ' on ' + n : '');
+    if (t == 'uturn') return 'Make a U turn';
+    if (t == 'roundabout')
+      return 'Enter roundabout' + (n.isNotEmpty ? ' to ' + n : '');
+    if (t == 'turn') {
+      if (m.contains('left'))
+        return 'Turn left' + (n.isNotEmpty ? ' onto ' + n : '');
+      if (m.contains('right'))
+        return 'Turn right' + (n.isNotEmpty ? ' onto ' + n : '');
+      return 'Follow route' + (n.isNotEmpty ? ' on ' + n : '');
+    }
+    return 'Follow route' + (n.isNotEmpty ? ' on ' + n : '');
+  }
+
+  Future<void> _maybeSpeakTurn() async {
+    if (!_voiceEnabled || !_started) return;
+    if (_steps.isEmpty) return;
+    final i = _stepIndex;
+    if (_spokenStepIndex == i) return;
+    _spokenStepIndex = i;
+    final s = _steps[i];
+    final text = _formatInstruction(s.type, s.modifier, s.name);
+    await _speak(text);
+  }
+
+  Future<void> _maybeSpeakApproach() async {
+    if (!_voiceEnabled || !_started) return;
+    if (_steps.isEmpty || userCoord == null) return;
+    final i = _stepIndex;
+    if (_approachSpokenIndex == i) return;
+    final s = _steps[i];
+    if (s.geom.isEmpty) return;
+    final end = s.geom.last;
+    final d = _distCalc.as(LengthUnit.Meter, userCoord!, end);
+    if (d <= 110 && d >= 90) {
+      _approachSpokenIndex = i;
+      String base = _formatInstruction(s.type, s.modifier, s.name);
+      final text = 'In one hundred meters, ' + base.toLowerCase();
+      await _speak(text);
+    }
+  }
+
   Future<void> _startNavigation() async {
     final o = widget.order;
     if (o == null) return;
@@ -270,6 +513,18 @@ class _NavigationScreenState extends State<NavigationScreen> {
       return;
     }
     _started = true;
+    setState(() {
+      _voiceEnabled = true;
+      _spokenStepIndex = null;
+      _approachSpokenIndex = null;
+      _pickupApproachSpoken = false;
+      if (o.payout > 0) {
+        _fareFixed = o.payout;
+        _fareLocked = true;
+        routeFare = o.payout;
+      }
+    });
+    await _speak('Starting navigation');
     if (DriverSession.mapboxToken.isNotEmpty) {
       setState(() {
         fromCoord = from;
@@ -278,18 +533,6 @@ class _NavigationScreenState extends State<NavigationScreen> {
       if (userCoord != null) {
         navToPickup = from != null;
         await _recalcRouteFromUser();
-        if (routeFare != null) {
-          await ApiClient.updateOrderStatus(
-            o.id,
-            'picked_up',
-            action: 'update_status',
-            extra: {
-              'driver_pickup_time': ApiClient.nowTs(),
-              'fee': routeFare,
-              'delivery_fee': routeFare,
-            },
-          );
-        }
         if (mounted) setState(() => showInfoOverlay = true);
       } else {
         if (from != null && to != null) {
@@ -297,18 +540,6 @@ class _NavigationScreenState extends State<NavigationScreen> {
           if (!ok) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Unable to get directions')),
-            );
-          }
-          if (routeFare != null) {
-            await ApiClient.updateOrderStatus(
-              o.id,
-              'picked_up',
-              action: 'update_status',
-              extra: {
-                'driver_pickup_time': ApiClient.nowTs(),
-                'fee': routeFare,
-                'delivery_fee': routeFare,
-              },
             );
           }
           if (mounted) setState(() => showInfoOverlay = true);
@@ -324,18 +555,6 @@ class _NavigationScreenState extends State<NavigationScreen> {
     });
     if (from != null && to != null) {
       await _fetchRoute(from, to);
-      if (routeFare != null && o != null) {
-        await ApiClient.updateOrderStatus(
-          o.id,
-          'picked_up',
-          action: 'update_status',
-          extra: {
-            'driver_pickup_time': ApiClient.nowTs(),
-            'fee': routeFare,
-            'delivery_fee': routeFare,
-          },
-        );
-      }
       if (mounted) setState(() => showInfoOverlay = true);
     } else {
       await _syncMapboxAnnotations();
@@ -375,8 +594,134 @@ class _NavigationScreenState extends State<NavigationScreen> {
   }
 
   Future<bool> _fetchRoute(LatLng from, LatLng to) async {
+    final gKey = DriverSession.googleMapsApiKey;
     final hasToken = DriverSession.mapboxToken.isNotEmpty;
     try {
+      if ((gKey).isNotEmpty) {
+        final url = Uri.parse(
+          'https://maps.googleapis.com/maps/api/directions/json?origin=${from.latitude},${from.longitude}&destination=${to.latitude},${to.longitude}&mode=driving&alternatives=false&units=metric&key=' +
+              gKey,
+        );
+        final headers = await AppMeta.androidAuthHeaders();
+        final res = await http
+            .get(
+              url,
+              headers: {
+                ...headers,
+                'User-Agent': 'driver-app/1.0',
+                'Accept': 'application/json',
+              },
+            )
+            .timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final data = jsonDecode(res.body);
+          if (data is Map &&
+              data['routes'] is List &&
+              (data['routes'] as List).isNotEmpty) {
+            final route = (data['routes'] as List).first as Map;
+            final overview =
+                (route['overview_polyline'] as Map?)?['points']?.toString() ??
+                '';
+            final pts = overview.isNotEmpty
+                ? _decodePolyline5(overview)
+                : const <LatLng>[];
+            if (pts.isNotEmpty) {
+              setState(() {
+                routePoints = pts;
+                double? distMeters;
+                double? durSecs;
+                final legs = route['legs'];
+                if (legs is List && legs.isNotEmpty) {
+                  final leg = legs.first as Map;
+                  distMeters = ((leg['distance'] as Map?)?['value'] as num?)
+                      ?.toDouble();
+                  durSecs = ((leg['duration'] as Map?)?['value'] as num?)
+                      ?.toDouble();
+                  final st = leg['steps'];
+                  final built = <_NavStep>[];
+                  if (st is List && st.isNotEmpty) {
+                    for (final e in st) {
+                      if (e is Map) {
+                        final name = _clean(
+                          (e['html_instructions'] ?? '').toString(),
+                        );
+                        final dm =
+                            ((e['distance'] as Map?)?['value'] as num?)
+                                ?.toDouble() ??
+                            0.0;
+                        final man = (e['maneuver'] ?? '')
+                            .toString()
+                            .toLowerCase();
+                        String type = 'continue';
+                        String modifier = '';
+                        if (man.contains('turn')) {
+                          type = 'turn';
+                          if (man.contains('left')) modifier = 'left';
+                          if (man.contains('right')) modifier = 'right';
+                        } else if (man.contains('roundabout')) {
+                          type = 'roundabout';
+                        } else if (man.contains('arrive')) {
+                          type = 'arrive';
+                        } else if (man.contains('depart')) {
+                          type = 'depart';
+                        }
+                        final gstr =
+                            ((e['polyline'] as Map?)?['points']?.toString() ??
+                            '');
+                        final g = gstr.isNotEmpty
+                            ? _decodePolyline5(gstr)
+                            : const <LatLng>[];
+                        built.add(_NavStep(name, dm, type, modifier, g));
+                      }
+                    }
+                  }
+                  _steps = built;
+                  _stepIndex = 0;
+                  if (_steps.isNotEmpty) {
+                    final s = _steps.first;
+                    _stepName = s.name;
+                    _stepDistMeters = s.distance;
+                    _stepType = s.type;
+                    _stepModifier = s.modifier;
+                    _stepGeom = s.geom;
+                    _spokenStepIndex = null;
+                  } else {
+                    _stepName = null;
+                    _stepDistMeters = null;
+                    _stepType = null;
+                    _stepModifier = null;
+                    _stepGeom = const [];
+                  }
+                }
+                if (distMeters != null) {
+                  routeDistanceKm = distMeters! / 1000.0;
+                  if (durSecs != null) {
+                    routeEtaMinutes = durSecs! / 60.0;
+                  } else {
+                    routeEtaMinutes = null;
+                  }
+                  final newFare = routeDistanceKm! * _ratePerKm;
+                  if (_fareLocked) {
+                    routeFare = _fareFixed;
+                  } else {
+                    routeFare = newFare;
+                    if (_started) {
+                      _fareFixed = newFare;
+                      _fareLocked = true;
+                    }
+                  }
+                } else {
+                  routeDistanceKm = null;
+                  routeEtaMinutes = null;
+                  if (!_fareLocked) routeFare = null;
+                }
+              });
+              await _maybeSpeakTurn();
+              return true;
+            }
+          }
+        }
+      }
       if (hasToken) {
         final url = Uri.parse(
           'https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?geometries=polyline6&steps=true&overview=full&access_token=${DriverSession.mapboxToken}',
@@ -396,10 +741,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 final distMeters = (route['distance'] as num?)?.toDouble();
                 if (distMeters != null) {
                   routeDistanceKm = distMeters / 1000.0;
-                  routeFare = routeDistanceKm! * _ratePerKm;
+                  final newFare = routeDistanceKm! * _ratePerKm;
+                  if (_fareLocked) {
+                    routeFare = _fareFixed;
+                  } else {
+                    routeFare = newFare;
+                    if (_started) {
+                      _fareFixed = newFare;
+                      _fareLocked = true;
+                    }
+                  }
                 } else {
                   routeDistanceKm = null;
-                  routeFare = null;
+                  if (!_fareLocked) routeFare = null;
                 }
                 final legs = route['legs'];
                 if (legs is List && legs.isNotEmpty) {
@@ -431,6 +785,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                     _stepType = s.type;
                     _stepModifier = s.modifier;
                     _stepGeom = s.geom;
+                    _spokenStepIndex = null;
                   } else {
                     _stepName = null;
                     _stepDistMeters = null;
@@ -440,6 +795,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
                   }
                 }
               });
+              await _maybeSpeakTurn();
               if (_mapbox != null) {
                 await _syncMapboxAnnotations();
                 await _fitCameraToTargetsIfNeeded();
@@ -467,10 +823,19 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 final distMeters = (route['distance'] as num?)?.toDouble();
                 if (distMeters != null) {
                   routeDistanceKm = distMeters / 1000.0;
-                  routeFare = routeDistanceKm! * _ratePerKm;
+                  final newFare = routeDistanceKm! * _ratePerKm;
+                  if (_fareLocked) {
+                    routeFare = _fareFixed;
+                  } else {
+                    routeFare = newFare;
+                    if (_started) {
+                      _fareFixed = newFare;
+                      _fareLocked = true;
+                    }
+                  }
                 } else {
                   routeDistanceKm = null;
-                  routeFare = null;
+                  if (!_fareLocked) routeFare = null;
                 }
               });
               await _syncMapboxAnnotations();
@@ -486,13 +851,54 @@ class _NavigationScreenState extends State<NavigationScreen> {
       setState(() {
         routePoints = [from, to];
         routeDistanceKm = km;
-        routeFare = km * _ratePerKm;
+        final newFare = km * _ratePerKm;
+        if (_fareLocked) {
+          routeFare = _fareFixed;
+        } else {
+          routeFare = newFare;
+          if (_started) {
+            _fareFixed = newFare;
+            _fareLocked = true;
+          }
+        }
       });
       await _syncMapboxAnnotations();
       await _fitCameraToTargetsIfNeeded();
       return true;
     } catch (_) {}
     return false;
+  }
+
+  List<LatLng> _decodePolyline5(String encoded) {
+    int index = 0;
+    int lat = 0;
+    int lng = 0;
+    final coords = <LatLng>[];
+    while (index < encoded.length) {
+      int result = 0;
+      int shift = 0;
+      int b;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      final dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lat += dlat;
+      result = 0;
+      shift = 0;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      final dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lng += dlng;
+      final latD = lat / 1e5;
+      final lngD = lng / 1e5;
+      coords.add(LatLng(latD, lngD));
+    }
+    return coords;
   }
 
   Future<void> _recalcRouteFromUser() async {
@@ -504,10 +910,26 @@ class _NavigationScreenState extends State<NavigationScreen> {
       target = toCoord;
     }
     if (target == null) return;
-    final reached = _distCalc.as(LengthUnit.Meter, userCoord!, target) < 40;
+    final reached = _distCalc.as(LengthUnit.Meter, userCoord!, target) < 80;
     if (reached && navToPickup) {
       navToPickup = false;
       target = toCoord;
+      final o = widget.order;
+      if (o != null) {
+        try {
+          await ApiClient.updateOrderStatus(
+            o.id,
+            'picked_up',
+            action: 'update_status',
+            extra: {
+              'driver_pickup_time': ApiClient.nowTs(),
+              'fee': _fareFixed ?? routeFare,
+              'delivery_fee': _fareFixed ?? routeFare,
+            },
+          );
+        } catch (_) {}
+      }
+      await _speak('Pickup complete. Navigating to dropoff');
     }
     if (target != null) {
       await _fetchRoute(userCoord!, target);
@@ -515,41 +937,31 @@ class _NavigationScreenState extends State<NavigationScreen> {
   }
 
   Future<void> _fitCameraToTargets() async {
-    final pts = <LatLng>[];
-    if (routePoints.isNotEmpty) {
-      pts.addAll(routePoints);
+    LatLng? center;
+    if (userCoord != null) {
+      center = userCoord!;
     } else {
-      if (userCoord != null) pts.add(userCoord!);
-      if (fromCoord != null) pts.add(fromCoord!);
-      if (toCoord != null) pts.add(toCoord!);
+      final pts = <LatLng>[];
+      if (routePoints.isNotEmpty) {
+        pts.addAll(routePoints);
+      } else {
+        if (fromCoord != null) pts.add(fromCoord!);
+        if (toCoord != null) pts.add(toCoord!);
+      }
+      if (pts.isEmpty) return;
+      double minLat = pts.first.latitude,
+          maxLat = pts.first.latitude,
+          minLng = pts.first.longitude,
+          maxLng = pts.first.longitude;
+      for (final p in pts) {
+        if (p.latitude < minLat) minLat = p.latitude;
+        if (p.latitude > maxLat) maxLat = p.latitude;
+        if (p.longitude < minLng) minLng = p.longitude;
+        if (p.longitude > maxLng) maxLng = p.longitude;
+      }
+      center = LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2);
     }
-    if (pts.isEmpty) return;
-    double minLat = pts.first.latitude,
-        maxLat = pts.first.latitude,
-        minLng = pts.first.longitude,
-        maxLng = pts.first.longitude;
-    for (final p in pts) {
-      if (p.latitude < minLat) minLat = p.latitude;
-      if (p.latitude > maxLat) maxLat = p.latitude;
-      if (p.longitude < minLng) minLng = p.longitude;
-      if (p.longitude > maxLng) maxLng = p.longitude;
-    }
-    final center = LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2);
-    final spanLat = (maxLat - minLat).abs();
-    final spanLng = (maxLng - minLng).abs();
-    final span = spanLat > spanLng ? spanLat : spanLng;
-    double zoom;
-    if (span < 0.01) {
-      zoom = 16;
-    } else if (span < 0.05) {
-      zoom = 15;
-    } else if (span < 0.2) {
-      zoom = 13;
-    } else if (span < 1.0) {
-      zoom = 11;
-    } else {
-      zoom = 9;
-    }
+    final zoom = _fixedZoom;
     double? brg;
     if (fromCoord != null && toCoord != null) {
       brg = _bearing(fromCoord!, toCoord!);
@@ -558,7 +970,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       await _mapbox!.setCamera(
         mapbox.CameraOptions(
           center: mapbox.Point(
-            coordinates: mapbox.Position(center.longitude, center.latitude),
+            coordinates: mapbox.Position(center!.longitude, center.latitude),
           ),
           zoom: zoom,
           pitch: 55,
@@ -567,7 +979,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       );
       _currentZoom = zoom;
     } else {
-      mapController.move(center, zoom);
+      mapController.move(center!, zoom);
     }
   }
 
@@ -623,7 +1035,7 @@ class _NavigationScreenState extends State<NavigationScreen> {
       await _polylineManager!.create(
         mapbox.PolylineAnnotationOptions(
           geometry: mapbox.LineString(coordinates: coords),
-          lineWidth: 8.0,
+          lineWidth: 12.0,
           lineColor: const Color(0xFF00A3FF).value,
           lineOpacity: 0.95,
         ),
@@ -693,13 +1105,47 @@ class _NavigationScreenState extends State<NavigationScreen> {
             final prevCoord = _lastSpeedCoord;
             _lastSpeedCoord = cur;
             _lastSpeedTime = now;
+            final prevDisplay = _displayCoord ?? prevCoord;
+            _displayCoord = prevDisplay == null
+                ? cur
+                : LatLng(
+                    prevDisplay.latitude +
+                        (cur.latitude - prevDisplay.latitude) * 0.20,
+                    prevDisplay.longitude +
+                        (cur.longitude - prevDisplay.longitude) * 0.20,
+                  );
+            if (routePoints.isNotEmpty && _displayCoord != null) {
+              final snap = _snapToRoute(_displayCoord!);
+              if (snap != null) _snappedCoord = snap;
+            } else {
+              _snappedCoord = null;
+            }
             setState(() {
               userCoord = cur;
-              centerCoord = userCoord;
+              centerCoord = _snappedCoord ?? _displayCoord;
               if (kmh != null) _speedKmh = kmh;
+              if (navToPickup && fromCoord != null) {
+                _pickupDistMeters = _distCalc.as(
+                  LengthUnit.Meter,
+                  cur,
+                  fromCoord!,
+                );
+              } else {
+                _pickupDistMeters = null;
+                _pickupApproachSpoken = false;
+              }
             });
+            if (navToPickup && fromCoord != null && _voiceEnabled && _started) {
+              final pd =
+                  _pickupDistMeters ??
+                  _distCalc.as(LengthUnit.Meter, cur, fromCoord!);
+              if (!_pickupApproachSpoken && pd < 120 && pd > 60) {
+                _pickupApproachSpoken = true;
+                await _speak('In one hundred meters, pickup');
+              }
+            }
             final shouldFollow = _started || ((_speedKmh ?? 0.0) > 0.5);
-            if (_mapbox != null) {
+            if (_gmap != null) {
               if (shouldFollow) {
                 double? targetBrg;
                 final gpsBrg = pos.heading;
@@ -716,7 +1162,47 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 final dtCam = _lastCamUpdate == null
                     ? 9999
                     : now.difference(_lastCamUpdate!).inMilliseconds;
-                if (moveMeters > 3.0 || dtCam > 500) {
+                if (moveMeters > 2.0 || dtCam > 450) {
+                  final newBearing = targetBrg ?? _lastBearing ?? 0.0;
+                  await _gmap!.animateCamera(
+                    gmap.CameraUpdate.newCameraPosition(
+                      gmap.CameraPosition(
+                        target: gmap.LatLng(
+                          (centerCoord ?? userCoord!)!.latitude,
+                          (centerCoord ?? userCoord!)!.longitude,
+                        ),
+                        zoom: _currentZoom,
+                        tilt: 55,
+                        bearing: newBearing,
+                      ),
+                    ),
+                  );
+                  _lastBearing = newBearing;
+                  _lastCamUpdate = now;
+                  if (_started) {
+                    await _recalcRouteFromUser();
+                    _updateCurrentStep();
+                  }
+                }
+              }
+            } else if (_mapbox != null) {
+              if (shouldFollow) {
+                double? targetBrg;
+                final gpsBrg = pos.heading;
+                if (gpsBrg.isFinite && gpsBrg >= 0) {
+                  targetBrg = gpsBrg;
+                } else if (_stepGeom.isNotEmpty) {
+                  targetBrg = _bearing(userCoord!, _stepGeom.last);
+                } else if (toCoord != null) {
+                  targetBrg = _bearing(userCoord!, toCoord!);
+                }
+                final moveMeters = prevCoord == null
+                    ? 9999.0
+                    : _distCalc.as(LengthUnit.Meter, prevCoord, cur);
+                final dtCam = _lastCamUpdate == null
+                    ? 9999
+                    : now.difference(_lastCamUpdate!).inMilliseconds;
+                if (moveMeters > 2.0 || dtCam > 450) {
                   final targetBearing = targetBrg ?? _lastBearing ?? 0.0;
                   double newBearing;
                   if (_lastBearing == null) {
@@ -725,29 +1211,23 @@ class _NavigationScreenState extends State<NavigationScreen> {
                     var diff = targetBearing - _lastBearing!;
                     while (diff > 180.0) diff -= 360.0;
                     while (diff < -180.0) diff += 360.0;
-                    final step = diff.clamp(-10.0, 10.0);
+                    final step = diff.clamp(-6.0, 6.0);
                     newBearing = _lastBearing! + step;
                   }
-                  final zoom = _speedKmh == null
-                      ? 16.0
-                      : (_speedKmh! < 10
-                            ? 16.5
-                            : (_speedKmh! < 40 ? 15.5 : 15.0));
                   await _mapbox!.flyTo(
                     mapbox.CameraOptions(
                       center: mapbox.Point(
                         coordinates: mapbox.Position(
-                          userCoord!.longitude,
-                          userCoord!.latitude,
+                          (centerCoord ?? userCoord!)!.longitude,
+                          (centerCoord ?? userCoord!)!.latitude,
                         ),
                       ),
-                      zoom: zoom,
-                      pitch: 60,
+                      zoom: _currentZoom,
+                      pitch: 55,
                       bearing: newBearing,
                     ),
-                    mapbox.MapAnimationOptions(duration: 500, startDelay: 0),
+                    mapbox.MapAnimationOptions(duration: 650, startDelay: 0),
                   );
-                  _currentZoom = zoom;
                   _lastBearing = newBearing;
                   _lastCamUpdate = now;
                   if (_started) {
@@ -765,18 +1245,12 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 final dtCam = _lastCamUpdate == null
                     ? 9999
                     : now.difference(_lastCamUpdate!).inMilliseconds;
-                if (moveMeters > 3.0 || dtCam > 500) {
+                if (moveMeters > 2.0 || dtCam > 450) {
                   final gpsBrg = pos.heading;
                   if (gpsBrg.isFinite && gpsBrg >= 0) {
                     _lastBearing = gpsBrg;
                   }
-                  final zoom = _speedKmh == null
-                      ? 16.0
-                      : (_speedKmh! < 10
-                            ? 16.5
-                            : (_speedKmh! < 40 ? 15.5 : 15.0));
-                  _currentZoom = zoom;
-                  mapController.move(userCoord!, _currentZoom);
+                  mapController.move(centerCoord ?? userCoord!, _currentZoom);
                   _lastCamUpdate = now;
                   if (_started) {
                     await _recalcRouteFromUser();
@@ -907,7 +1381,11 @@ class _NavigationScreenState extends State<NavigationScreen> {
     final o = widget.order;
     return WillPopScope(
       onWillPop: () async {
-        Navigator.pop(context, {'started': _started});
+        if (Navigator.canPop(context)) {
+          Navigator.pop(context, {'started': _started});
+        } else {
+          Navigator.pushReplacementNamed(context, '/dashboard');
+        }
         return false;
       },
       child: Scaffold(
@@ -917,131 +1395,111 @@ class _NavigationScreenState extends State<NavigationScreen> {
             Positioned.fill(
               child: GestureDetector(
                 onTap: () => setState(() => showInfoOverlay = !showInfoOverlay),
-                child: DriverSession.mapboxToken.isNotEmpty
-                    ? mapbox.MapWidget(
-                        styleUri: 'mapbox://styles/mapbox/navigation-night-v1',
-                        cameraOptions: mapbox.CameraOptions(
-                          center: mapbox.Point(
-                            coordinates: mapbox.Position(
-                              (centerCoord ??
-                                      fromCoord ??
-                                      toCoord ??
-                                      const LatLng(-26.2041, 28.0473))
-                                  .longitude,
-                              (centerCoord ??
-                                      fromCoord ??
-                                      toCoord ??
-                                      const LatLng(-26.2041, 28.0473))
-                                  .latitude,
-                            ),
+                child: (DriverSession.googleMapsApiKey.isNotEmpty)
+                    ? gmap.GoogleMap(
+                        mapType: gmap.MapType.normal,
+                        initialCameraPosition: gmap.CameraPosition(
+                          target: gmap.LatLng(
+                            (userCoord ??
+                                    centerCoord ??
+                                    fromCoord ??
+                                    toCoord ??
+                                    const LatLng(-26.2041, 28.0473))
+                                .latitude,
+                            (userCoord ??
+                                    centerCoord ??
+                                    fromCoord ??
+                                    toCoord ??
+                                    const LatLng(-26.2041, 28.0473))
+                                .longitude,
                           ),
-                          zoom: 15,
-                          pitch: 55,
+                          zoom: _fixedZoom,
+                          tilt: 55,
                           bearing: 0,
                         ),
-                        onMapCreated: (m) async {
-                          _mapbox = m;
+                        onMapCreated: (c) async {
+                          _gmap = c;
                           try {
-                            await _mapbox!.location.updateSettings(
-                              mapbox.LocationComponentSettings(
-                                enabled: true,
-                                puckBearingEnabled: true,
-                                puckBearing: mapbox.PuckBearing.COURSE,
-                                locationPuck: mapbox.LocationPuck(
-                                  locationPuck3D: mapbox.LocationPuck3D(
-                                    modelUri:
-                                        'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CarConcept/glTF-Binary/CarConcept.glb',
-                                    modelScale: [1.0, 1.0, 1.0],
-                                    modelRotation: [0.0, 0.0, 0.0],
-                                  ),
-                                ),
-                              ),
-                            );
-                          } catch (_) {}
-                          await _syncMapboxAnnotations();
-                          try {
-                            await _mapbox!.style.addStyleLayer(
-                              '{"id":"3d-buildings","type":"fill-extrusion","source":"composite","source-layer":"building","filter":["==",["get","extrude"],"true"],"minzoom":15,"paint":{"fill-extrusion-color":"#aaa","fill-extrusion-height":["interpolate",["linear"],["zoom"],15,0,15.05,["get","height"]],"fill-extrusion-base":["interpolate",["linear"],["zoom"],15,0,15.05,["get","min_height"]],"fill-extrusion-opacity":0.6}}',
-                              null,
-                            );
-                            await _mapbox!.style.addStyleLayer(
-                              '{"id":"sky","type":"sky","paint":{"sky-type":"atmosphere","sky-atmosphere-sun-intensity":0.5}}',
-                              null,
-                            );
+                            await _gmap!.setMapStyle(_googleDarkBlueStyleJson);
                           } catch (_) {}
                           if (widget.autoStart) {
                             await _startNavigation();
                           }
                         },
+                        markers: _gmapMarkers(),
+                        polylines: _gmapPolylines(),
+                        myLocationEnabled: true,
+                        myLocationButtonEnabled: false,
+                        compassEnabled: false,
+                        trafficEnabled: false,
+                        zoomControlsEnabled: false,
+                        tiltGesturesEnabled: true,
+                        buildingsEnabled: true,
+                        indoorViewEnabled: true,
                       )
                     : fmap.FlutterMap(
                         mapController: mapController,
                         options: fmap.MapOptions(
-                          initialCenter:
-                              centerCoord ??
-                              fromCoord ??
-                              toCoord ??
-                              const LatLng(-26.2041, 28.0473),
-                          initialZoom: 13,
+                          initialCenter: (userCoord ??
+                                  centerCoord ??
+                                  fromCoord ??
+                                  toCoord ??
+                                  const LatLng(-26.2041, 28.0473)),
+                          initialZoom: _fixedZoom,
                         ),
                         children: [
                           fmap.TileLayer(
                             urlTemplate:
-                                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                            subdomains: const ['a', 'b', 'c'],
                           ),
-                          if (fromCoord != null || toCoord != null)
-                            fmap.MarkerLayer(
-                              markers: [
-                                if (fromCoord != null)
-                                  fmap.Marker(
-                                    point: fromCoord!,
-                                    width: 40,
-                                    height: 40,
-                                    child: const Icon(
-                                      Icons.location_on,
-                                      color: Colors.lightBlueAccent,
-                                      size: 36,
-                                    ),
-                                  ),
-                                if (toCoord != null)
-                                  fmap.Marker(
-                                    point: toCoord!,
-                                    width: 40,
-                                    height: 40,
-                                    child: const Icon(
-                                      Icons.flag,
-                                      color: Colors.redAccent,
-                                      size: 32,
-                                    ),
-                                  ),
-                                if (userCoord != null)
-                                  fmap.Marker(
-                                    point: userCoord!,
-                                    width: 40,
-                                    height: 40,
-                                    child: Transform.rotate(
-                                      angle:
-                                          ((_lastBearing ?? 0.0) * math.pi) /
-                                          180.0,
-                                      child: const Icon(
-                                        Icons.directions_car,
-                                        color: Colors.orangeAccent,
-                                        size: 34,
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          if (routePoints.isNotEmpty)
-                            fmap.PolylineLayer(
-                              polylines: [
+                          fmap.PolylineLayer(
+                            polylines: [
+                              if (routePoints.isNotEmpty)
                                 fmap.Polyline(
                                   points: routePoints,
-                                  color: Colors.blue,
+                                  color: const Color(0xFF4285F4),
                                   strokeWidth: 6,
                                 ),
-                              ],
-                            ),
+                            ],
+                          ),
+                          fmap.MarkerLayer(
+                            markers: [
+                              if (fromCoord != null)
+                                fmap.Marker(
+                                  point: fromCoord!,
+                                  width: 30,
+                                  height: 30,
+                                  child: const Icon(
+                                    Icons.store,
+                                    color: Colors.orange,
+                                  ),
+                                ),
+                              if (toCoord != null)
+                                fmap.Marker(
+                                  point: toCoord!,
+                                  width: 30,
+                                  height: 30,
+                                  child: const Icon(
+                                    Icons.flag,
+                                    color: Colors.redAccent,
+                                  ),
+                                ),
+                              if ((
+                                      _snappedCoord ?? _displayCoord ?? userCoord) !=
+                                  null)
+                                fmap.Marker(
+                                  point:
+                                      (_snappedCoord ?? _displayCoord ?? userCoord)!,
+                                  width: 36,
+                                  height: 36,
+                                  child: const Icon(
+                                    Icons.directions_car,
+                                    color: Colors.deepOrange,
+                                  ),
+                                ),
+                            ],
+                          ),
                         ],
                       ),
               ),
@@ -1051,6 +1509,18 @@ class _NavigationScreenState extends State<NavigationScreen> {
                 child: Center(
                   child: CircularProgressIndicator(color: Colors.white70),
                 ),
+              ),
+            if (!DriverSession.googleMapsApiKey.isNotEmpty &&
+                widget.autoStart &&
+                !_didScheduleAutoStart)
+              Builder(
+                builder: (_) {
+                  _didScheduleAutoStart = true;
+                  Future.microtask(() async {
+                    await _startNavigation();
+                  });
+                  return const SizedBox.shrink();
+                },
               ),
             Positioned(
               top: 12,
@@ -1139,6 +1609,45 @@ class _NavigationScreenState extends State<NavigationScreen> {
                       ),
               ),
             ),
+            Positioned(
+              top: 56,
+              left: 12,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child:
+                    (navToPickup &&
+                        _pickupDistMeters != null &&
+                        _pickupDistMeters! <= 200 &&
+                        _pickupDistMeters! > 40)
+                    ? Container(
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.65),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.store, color: Colors.white70),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Near pickup ' +
+                                  _pickupDistMeters!.toStringAsFixed(0) +
+                                  ' m',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ),
             if (routeFare != null)
               Positioned(
                 top: 12,
@@ -1164,6 +1673,44 @@ class _NavigationScreenState extends State<NavigationScreen> {
                   ),
                 ),
               ),
+            Positioned(
+              top: 12,
+              right: 12,
+              child: Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      color: Colors.white,
+                      icon: Icon(
+                        showInfoOverlay
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                      ),
+                      onPressed: () =>
+                          setState(() => showInfoOverlay = !showInfoOverlay),
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      color: Colors.white,
+                      icon: Icon(
+                        _voiceEnabled ? Icons.volume_up : Icons.volume_off,
+                      ),
+                      onPressed: () async {
+                        setState(() => _voiceEnabled = !_voiceEnabled);
+                        if (_voiceEnabled) await _speak('Voice guidance on');
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
             Positioned(
               top: 12,
               left: 12,
@@ -1272,18 +1819,108 @@ class _NavigationScreenState extends State<NavigationScreen> {
                           mainAxisSize: MainAxisSize.min,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            if (o != null)
-                              Text(
-                                'Customer: ' + _clean(o.customerName),
-                                style: const TextStyle(color: Colors.white),
+                            if (o != null && (o.foodType ?? '').isNotEmpty)
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.restaurant_menu,
+                                    color: Colors.white70,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      _clean(o.foodType!),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            Text(
-                              'From: ${o != null ? _clean(o.pickupAddress) : '-'}',
-                              style: const TextStyle(color: Colors.white70),
+                            if (o != null) ...[
+                              const SizedBox(height: 6),
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.person,
+                                    color: Colors.white70,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      _clean(o.customerName),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    icon: const Icon(
+                                      Icons.phone,
+                                      color: Colors.white70,
+                                    ),
+                                    onPressed: () async {
+                                      String phone = (o.customerPhone ?? '')
+                                          .trim();
+                                      if (phone.isEmpty) {
+                                        final fetched =
+                                            await ApiClient.fetchOrderDetailsFromOrdersPage(
+                                              o.id,
+                                            );
+                                        if (fetched
+                                                ?.customerPhone
+                                                ?.isNotEmpty ==
+                                            true) {
+                                          phone = fetched!.customerPhone!;
+                                        }
+                                      }
+                                      if (phone.isEmpty) return;
+                                      final uri = Uri.parse('tel:' + phone);
+                                      try {
+                                        await launchUrl(
+                                          uri,
+                                          mode: LaunchMode.externalApplication,
+                                        );
+                                      } catch (_) {}
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ],
+                            const SizedBox(height: 6),
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Icon(Icons.store, color: Colors.white70),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    o != null ? _clean(o.pickupAddress) : '-',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                            Text(
-                              'To:   ${o != null ? _clean(o.deliveryAddress) : '-'}',
-                              style: const TextStyle(color: Colors.white70),
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Icon(Icons.place, color: Colors.white70),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    o != null ? _clean(o.deliveryAddress) : '-',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                             const SizedBox(height: 6),
                             Builder(
@@ -1291,42 +1928,87 @@ class _NavigationScreenState extends State<NavigationScreen> {
                                 final dist = routeDistanceKm ?? o?.distanceKm;
                                 if (dist == null)
                                   return const SizedBox.shrink();
-                                return Text(
-                                  'Distance: ' +
-                                      dist.toStringAsFixed(1) +
-                                      ' km',
-                                  style: const TextStyle(color: Colors.white70),
+                                return Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.straighten,
+                                      color: Colors.white70,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      dist.toStringAsFixed(1) + ' km',
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                      ),
+                                    ),
+                                  ],
                                 );
                               },
                             ),
-                            Builder(
-                              builder: (_) {
-                                if (userCoord == null)
-                                  return const SizedBox.shrink();
-                                final stage = navToPickup
-                                    ? 'To Pickup'
-                                    : 'To Dropoff';
-                                return Text(
-                                  'Stage: ' + stage,
-                                  style: const TextStyle(color: Colors.white70),
-                                );
-                              },
-                            ),
+                            if (routeEtaMinutes != null)
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.schedule,
+                                    color: Colors.white70,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    routeEtaMinutes!.toStringAsFixed(0) +
+                                        ' min',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            if (userCoord != null)
+                              Row(
+                                children: [
+                                  const Icon(Icons.flag, color: Colors.white70),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    navToPickup ? 'To Pickup' : 'To Dropoff',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            const SizedBox(height: 6),
                             if (routeFare != null)
-                              Text(
-                                'Cost: R ' + routeFare!.toStringAsFixed(2),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w600,
-                                ),
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.attach_money,
+                                    color: Colors.white70,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'R ' + routeFare!.toStringAsFixed(2),
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
                               ),
                             if (o != null)
-                              Text(
-                                'Offer: R ' + o.payout.toStringAsFixed(2),
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontWeight: FontWeight.w500,
-                                ),
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.local_offer,
+                                    color: Colors.white70,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'R ' + o.payout.toStringAsFixed(2),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
                               ),
                             const SizedBox(height: 12),
                             LayoutBuilder(
@@ -1414,10 +2096,18 @@ class _NavigationScreenState extends State<NavigationScreen> {
                                               ),
                                             );
                                           }
-                                          if (mounted)
-                                            Navigator.pop(context, {
-                                              'started': _started,
-                                            });
+                                          if (mounted) {
+                                            if (Navigator.canPop(context)) {
+                                              Navigator.pop(context, {
+                                                'started': _started,
+                                              });
+                                            } else {
+                                              Navigator.pushReplacementNamed(
+                                                context,
+                                                '/dashboard',
+                                              );
+                                            }
+                                          }
                                         },
                                         child: Row(
                                           mainAxisAlignment:
@@ -1503,49 +2193,64 @@ class _NavigationScreenState extends State<NavigationScreen> {
                                     SizedBox(
                                       width: btnW,
                                       child: ElevatedButton(
-                                        onPressed: () async {
-                                          if (o != null) {
-                                            ScaffoldMessenger.of(
-                                              context,
-                                            ).showSnackBar(
-                                              const SnackBar(
-                                                content: Text(
-                                                  'Marking delivered...',
-                                                ),
-                                              ),
-                                            );
-                                            final ok =
-                                                await ApiClient.updateOrderStatus(
-                                                  o.id,
-                                                  'delivered',
-                                                  action: 'update_status',
-                                                  extra: {
-                                                    'driver_delivery_time':
-                                                        ApiClient.nowTs(),
-                                                    if (routeFare != null)
-                                                      'delivery_fee': routeFare,
-                                                  },
-                                                );
-                                            ScaffoldMessenger.of(
-                                              context,
-                                            ).hideCurrentSnackBar();
-                                            ScaffoldMessenger.of(
-                                              context,
-                                            ).showSnackBar(
-                                              SnackBar(
-                                                content: Text(
-                                                  ok
-                                                      ? 'Delivery marked as complete'
-                                                      : 'Failed to update delivery',
-                                                ),
-                                              ),
-                                            );
-                                            if (ok && mounted)
-                                              Navigator.pop(context, {
-                                                'started': _started,
-                                              });
-                                          }
-                                        },
+                                        onPressed:
+                                            (o == null ||
+                                                _deliveredDone ||
+                                                ((o.status).toLowerCase() ==
+                                                    'delivered'))
+                                            ? null
+                                            : () async {
+                                                if (o != null) {
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    const SnackBar(
+                                                      content: Text(
+                                                        'Marking delivered...',
+                                                      ),
+                                                    ),
+                                                  );
+                                                  final ok =
+                                                      await ApiClient.markDeliveredOrdersPhp(
+                                                        o.id,
+                                                        fee: routeFare,
+                                                      );
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).hideCurrentSnackBar();
+                                                  ScaffoldMessenger.of(
+                                                    context,
+                                                  ).showSnackBar(
+                                                    SnackBar(
+                                                      content: Text(
+                                                        ok
+                                                            ? 'Delivery marked as complete'
+                                                            : (ApiClient
+                                                                      .lastError ??
+                                                                  'Failed to update delivery'),
+                                                      ),
+                                                    ),
+                                                  );
+                                                  if (ok && mounted) {
+                                                    setState(
+                                                      () =>
+                                                          _deliveredDone = true,
+                                                    );
+                                                    if (Navigator.canPop(
+                                                      context,
+                                                    )) {
+                                                      Navigator.pop(context, {
+                                                        'started': _started,
+                                                      });
+                                                    } else {
+                                                      Navigator.pushReplacementNamed(
+                                                        context,
+                                                        '/dashboard',
+                                                      );
+                                                    }
+                                                  }
+                                                }
+                                              },
                                         child: Row(
                                           mainAxisAlignment:
                                               MainAxisAlignment.center,
@@ -1575,10 +2280,72 @@ class _NavigationScreenState extends State<NavigationScreen> {
     );
   }
 
+  Set<gmap.Marker> _gmapMarkers() {
+    final m = <gmap.Marker>{};
+    final o = widget.order;
+    if (fromCoord != null) {
+      m.add(
+        gmap.Marker(
+          markerId: const gmap.MarkerId('pickup'),
+          position: gmap.LatLng(fromCoord!.latitude, fromCoord!.longitude),
+          infoWindow: gmap.InfoWindow(
+            title: o != null ? 'Pickup: ' + _clean(o.pickupAddress) : 'Pickup',
+          ),
+        ),
+      );
+    }
+    if (toCoord != null) {
+      m.add(
+        gmap.Marker(
+          markerId: const gmap.MarkerId('dropoff'),
+          position: gmap.LatLng(toCoord!.latitude, toCoord!.longitude),
+          infoWindow: gmap.InfoWindow(
+            title: o != null
+                ? 'Dropoff: ' + _clean(o.deliveryAddress)
+                : 'Dropoff',
+          ),
+        ),
+      );
+    }
+    final uc = (_snappedCoord ?? _displayCoord ?? userCoord);
+    if (uc != null) {
+      m.add(
+        gmap.Marker(
+          markerId: const gmap.MarkerId('driver'),
+          position: gmap.LatLng(uc.latitude, uc.longitude),
+          rotation: (_lastBearing ?? 0.0),
+          icon:
+              _carIcon ??
+              gmap.BitmapDescriptor.defaultMarkerWithHue(
+                gmap.BitmapDescriptor.hueOrange,
+              ),
+        ),
+      );
+    }
+    return m;
+  }
+
+  Set<gmap.Polyline> _gmapPolylines() {
+    if (routePoints.isEmpty) return const <gmap.Polyline>{};
+    return {
+      gmap.Polyline(
+        polylineId: const gmap.PolylineId('route'),
+        points: routePoints
+            .map((e) => gmap.LatLng(e.latitude, e.longitude))
+            .toList(),
+        width: 10,
+        color: const Color(0xFF4285F4),
+        geodesic: true,
+      ),
+    };
+  }
+
   Future<void> _zoomBy(double delta) async {
     final z = (_currentZoom + delta).clamp(3.0, 20.0);
     _currentZoom = z;
-    if (_mapbox != null) {
+    if (_gmap != null) {
+      await _gmap!.animateCamera(gmap.CameraUpdate.zoomTo(z));
+    } else if (_mapbox != null) {
       await _mapbox!.flyTo(
         mapbox.CameraOptions(zoom: z),
         mapbox.MapAnimationOptions(duration: 250, startDelay: 0),
@@ -1592,6 +2359,41 @@ class _NavigationScreenState extends State<NavigationScreen> {
     _didInitialFit = false;
     await _fitCameraToTargetsIfNeeded();
   }
+
+  LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
+    final ax = a.longitude;
+    final ay = a.latitude;
+    final bx = b.longitude;
+    final by = b.latitude;
+    final px = p.longitude;
+    final py = p.latitude;
+    final vx = bx - ax;
+    final vy = by - ay;
+    final wx = px - ax;
+    final wy = py - ay;
+    final denom = (vx * vx) + (vy * vy);
+    double t = denom == 0.0 ? 0.0 : ((wx * vx) + (wy * vy)) / denom;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    return LatLng(ay + vy * t, ax + vx * t);
+  }
+
+  LatLng? _snapToRoute(LatLng p) {
+    if (routePoints.isEmpty) return null;
+    LatLng best = routePoints.first;
+    double bestD = _distCalc.as(LengthUnit.Meter, p, best);
+    for (int i = 0; i < routePoints.length - 1; i++) {
+      final a = routePoints[i];
+      final b = routePoints[i + 1];
+      final proj = _projectOnSegment(p, a, b);
+      final d = _distCalc.as(LengthUnit.Meter, p, proj);
+      if (d < bestD) {
+        bestD = d;
+        best = proj;
+      }
+    }
+    return best;
+  }
 }
 
 class _NavStep {
@@ -1602,3 +2404,6 @@ class _NavStep {
   final List<LatLng> geom;
   const _NavStep(this.name, this.distance, this.type, this.modifier, this.geom);
 }
+
+const String _googleDarkBlueStyleJson =
+    '[{"elementType":"geometry","stylers":[{"color":"#1b2a49"}]},{"elementType":"labels.icon","stylers":[{"visibility":"off"}]},{"elementType":"labels.text.fill","stylers":[{"color":"#8aa1b1"}]},{"elementType":"labels.text.stroke","stylers":[{"color":"#0f1a2b"}]},{"featureType":"administrative","elementType":"geometry","stylers":[{"color":"#2a3e66"}]},{"featureType":"poi","elementType":"geometry","stylers":[{"color":"#12223b"}]},{"featureType":"poi","elementType":"labels.text.fill","stylers":[{"color":"#6f8aa5"}]},{"featureType":"poi.park","elementType":"geometry","stylers":[{"color":"#0e1e34"}]},{"featureType":"road","elementType":"geometry","stylers":[{"color":"#2c406e"}]},{"featureType":"road","elementType":"labels.text.fill","stylers":[{"color":"#9bb3c9"}]},{"featureType":"road","elementType":"labels.text.stroke","stylers":[{"color":"#0f1a2b"}]},{"featureType":"road.highway","elementType":"geometry","stylers":[{"color":"#2a5f8a"}]},{"featureType":"road.highway","elementType":"geometry.stroke","stylers":[{"color":"#1e486a"}]},{"featureType":"transit","elementType":"geometry","stylers":[{"color":"#1a2e50"}]},{"featureType":"transit.station","elementType":"labels.text.fill","stylers":[{"color":"#7b94ad"}]},{"featureType":"water","elementType":"geometry","stylers":[{"color":"#0b1324"}]}]';

@@ -7,12 +7,14 @@ plugins {
 
 android {
     namespace = "com.example.driver"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
+    buildToolsVersion = "34.0.0"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -25,9 +27,25 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        val lpKey = run {
+            val f = rootProject.file("local.properties")
+            if (f.exists()) {
+                val line = f.readLines()
+                    .firstOrNull { it.startsWith("GOOGLE_MAPS_API_KEY=") }
+                line?.substringAfter("=")?.trim()
+            } else null
+        }
+        val mapsKey = (
+            System.getenv("GOOGLE_MAPS_API_KEY")
+                ?: (project.findProperty("GOOGLE_MAPS_API_KEY") as String?)
+                ?: lpKey
+                ?: ""
+            ).trim()
+        manifestPlaceholders["GOOGLE_MAPS_API_KEY"] = mapsKey
     }
 
     buildTypes {
@@ -41,4 +59,8 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }

@@ -1,3 +1,5 @@
+import 'package:flutter/services.dart';
+
 class Order {
   final String id;
   final String customerName;
@@ -9,6 +11,8 @@ class Order {
   final double? dealerLat;
   final double? dealerLng;
   final double? distanceKm;
+  final String? foodType;
+  final DateTime? createdAt;
 
   const Order({
     required this.id,
@@ -21,6 +25,8 @@ class Order {
     this.dealerLat,
     this.dealerLng,
     this.distanceKm,
+    this.foodType,
+    this.createdAt,
   });
 }
 
@@ -193,4 +199,56 @@ class DriverSession {
       'https://' + apiHost + '/drivers/driver_api.php';
   static String? authToken;
   static String mapboxToken = '';
+  static String googleMapsApiKey = const String.fromEnvironment(
+    'GOOGLE_MAPS_API_KEY',
+    defaultValue: '',
+  );
+  static DateTime? lastDeliveredAt;
+}
+
+class AppMeta {
+  static const _ch = MethodChannel('com.example.driver/app_meta');
+  static Future<String> googleApiKey() async {
+    try {
+      final v = await _ch.invokeMethod<String>('getGoogleMapsApiKey');
+      return (v ?? '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<void> ensureGoogleApiKeyLoaded() async {
+    if (DriverSession.googleMapsApiKey.isNotEmpty) return;
+    final v = await googleApiKey();
+    if (v.isNotEmpty) {
+      DriverSession.googleMapsApiKey = v;
+    }
+  }
+
+  static Map<String, String>? _identity;
+  static Future<Map<String, String>> androidIdentity() async {
+    if (_identity != null) return _identity!;
+    try {
+      final v = await _ch.invokeMethod<Map<dynamic, dynamic>>(
+        'getAndroidAppIdentity',
+      );
+      final pkg = (v?['package'] ?? '').toString();
+      final sha1 = (v?['sha1'] ?? '').toString();
+      _identity = {'package': pkg, 'sha1': sha1};
+      return _identity!;
+    } catch (_) {
+      _identity = {'package': 'com.example.driver', 'sha1': ''};
+      return _identity!;
+    }
+  }
+
+  static Future<Map<String, String>> androidAuthHeaders() async {
+    final id = await androidIdentity();
+    final pkg = (id['package'] ?? '').trim();
+    final sha1 = (id['sha1'] ?? '').trim();
+    final h = <String, String>{};
+    if (pkg.isNotEmpty) h['X-Android-Package'] = pkg;
+    if (sha1.isNotEmpty) h['X-Android-Cert'] = sha1;
+    return h;
+  }
 }

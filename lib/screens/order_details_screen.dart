@@ -23,6 +23,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   double? pay;
   static const double _ratePerKm = 5.0;
   bool navigationStarted = false;
+  bool deliveredDone = false;
 
   String _clean(String? v) {
     final s = (v ?? '').toString();
@@ -50,7 +51,13 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       );
       if (d != null) {
         setState(() => details = d);
-        await _computePriceFor(d);
+        if (d.payout > 0) {
+          setState(() {
+            pay = d.payout;
+          });
+        } else {
+          await _computePriceFor(d);
+        }
       } else {
         setState(() => error = 'Failed to load order');
       }
@@ -116,6 +123,12 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
   Future<void> _computePriceFor(Order o) async {
     try {
+      if (o.payout > 0) {
+        setState(() {
+          pay = o.payout;
+        });
+        return;
+      }
       final from = await _geocode(_clean(o.pickupAddress));
       final to = await _geocode(_clean(o.deliveryAddress));
       if (from == null || to == null) return;
@@ -289,9 +302,36 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                             vertical: 10,
                           ),
                         ),
-                        onPressed: (o == null || !navigationStarted)
+                        onPressed:
+                            (o == null ||
+                                deliveredDone ||
+                                ((o.status).toLowerCase() == 'delivered'))
                             ? null
                             : () async {
+                                final okConfirm =
+                                    await showDialog<bool>(
+                                      context: context,
+                                      builder: (_) => AlertDialog(
+                                        title: const Text('Cancel Delivery'),
+                                        content: const Text(
+                                          'Return this order to awaiting?',
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context, false),
+                                            child: const Text('No'),
+                                          ),
+                                          ElevatedButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context, true),
+                                            child: const Text('Yes'),
+                                          ),
+                                        ],
+                                      ),
+                                    ) ??
+                                    false;
+                                if (!okConfirm) return;
                                 ScaffoldMessenger.of(
                                   context,
                                 ).hideCurrentSnackBar();
@@ -300,11 +340,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                     content: Text('Cancelling delivery...'),
                                   ),
                                 );
-                                final ok = await ApiClient.updateOrderStatus(
-                                  o!.id,
-                                  'awaiting',
-                                  action: 'update_status',
-                                );
+                                final ok = await ApiClient.cancelOrder(o!.id);
                                 ScaffoldMessenger.of(
                                   context,
                                 ).hideCurrentSnackBar();
@@ -313,11 +349,22 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                     content: Text(
                                       ok
                                           ? 'Order returned to awaiting'
-                                          : 'Failed to cancel',
+                                          : (ApiClient.lastError ??
+                                                'Failed to cancel'),
                                     ),
                                   ),
                                 );
-                                if (ok && mounted) Navigator.pop(context);
+                                if (!mounted) return;
+                                if (ok) {
+                                  if (Navigator.canPop(context)) {
+                                    Navigator.pop(context);
+                                  } else {
+                                    Navigator.pushReplacementNamed(
+                                      context,
+                                      '/dashboard',
+                                    );
+                                  }
+                                }
                               },
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.center,
@@ -339,9 +386,33 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                             vertical: 10,
                           ),
                         ),
-                        onPressed: (o == null || !navigationStarted)
+                        onPressed: o == null
                             ? null
                             : () async {
+                                final okConfirm =
+                                    await showDialog<bool>(
+                                      context: context,
+                                      builder: (_) => AlertDialog(
+                                        title: const Text('Confirm Delivery'),
+                                        content: const Text(
+                                          'Mark this order as delivered?',
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context, false),
+                                            child: const Text('No'),
+                                          ),
+                                          ElevatedButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context, true),
+                                            child: const Text('Yes'),
+                                          ),
+                                        ],
+                                      ),
+                                    ) ??
+                                    false;
+                                if (!okConfirm) return;
                                 ScaffoldMessenger.of(
                                   context,
                                 ).hideCurrentSnackBar();
@@ -350,11 +421,17 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                     content: Text('Marking delivered...'),
                                   ),
                                 );
-                                final ok = await ApiClient.updateOrderStatus(
-                                  o!.id,
-                                  'delivered',
-                                  action: 'update_status',
-                                );
+                                final extra = <String, dynamic>{
+                                  'driver_delivered_time': ApiClient.nowTs(),
+                                  'delivered_at': ApiClient.nowTs(),
+                                  if (pay != null) 'delivery_fee': pay,
+                                  if (pay != null) 'fee': pay,
+                                };
+                                final ok =
+                                    await ApiClient.markDeliveredOrdersPhp(
+                                      o!.id,
+                                      fee: pay,
+                                    );
                                 ScaffoldMessenger.of(
                                   context,
                                 ).hideCurrentSnackBar();
@@ -363,11 +440,23 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                     content: Text(
                                       ok
                                           ? 'Marked as delivered'
-                                          : 'Failed to update status',
+                                          : (ApiClient.lastError ??
+                                                'Failed to update status'),
                                     ),
                                   ),
                                 );
-                                if (ok && mounted) Navigator.pop(context);
+                                if (!mounted) return;
+                                if (ok) {
+                                  setState(() => deliveredDone = true);
+                                  if (Navigator.canPop(context)) {
+                                    Navigator.pop(context);
+                                  } else {
+                                    Navigator.pushReplacementNamed(
+                                      context,
+                                      '/dashboard',
+                                    );
+                                  }
+                                }
                               },
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.center,

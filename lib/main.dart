@@ -8,6 +8,7 @@ import 'screens/profile_screen.dart';
 import 'screens/order_details_screen.dart';
 import 'screens/navigation_screen.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart';
+import 'services/notifications.dart';
 
 void main() {
   const String envToken = String.fromEnvironment('ACCESS_TOKEN');
@@ -44,6 +45,7 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
+    Notifications.init();
     return MaterialApp(
       title: 'Driver',
       theme: AppTheme.dark,

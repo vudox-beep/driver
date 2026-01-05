@@ -3,8 +3,10 @@ import 'dart:async';
 import '../models/models.dart';
 import '../theme.dart';
 import '../services/api_client.dart';
+import '../services/notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -36,6 +38,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Timer? _ordersTimer;
   Timer? _statsTimer;
   StreamSubscription<Position>? _posSub;
+  final _lastOrdersStatus = <String, String>{};
+  FlutterTts? _tts;
   void _safeSetState(VoidCallback fn) {
     if (!mounted) return;
     setState(fn);
@@ -49,14 +53,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
     try {
       final avail = await ApiClient.fetchAvailableOrders();
       final mine = await ApiClient.fetchMyOrders();
+      List<Order> all = const <Order>[];
+      if (currentUser?.driverId != null) {
+        try {
+          all = await ApiClient.fetchOrders(currentUser!.driverId!);
+        } catch (_) {}
+      }
       await _ensureLocation();
       final nearbyAvail = _applyDistanceFilter(
         avail.where((o) {
           final s = o.status.toLowerCase();
-          return s == 'awaiting' || s == 'confirmed';
+          return s == 'awaiting' || s == 'confirmed' || s == 'new';
         }).toList(),
       );
       final mineWithDist = _applyDistanceFilter(mine);
+      final allWithDist = _applyDistanceFilter(all);
+      // Detect new/updated orders before updating state
+      final prev = Map<String, String>.from(_lastOrdersStatus);
       _safeSetState(() {
         _myOrders
           ..clear()
@@ -68,14 +81,63 @@ class _DashboardScreenState extends State<DashboardScreen> {
         for (final o in nearbyAvail) {
           map.putIfAbsent(o.id, () => o);
         }
-        final combined = map.values.toList();
+        for (final o in allWithDist) {
+          map[o.id] = o;
+        }
+        List<Order> combined = map.values.toList();
+        combined = combined.where((o) {
+          final s = o.status.toLowerCase();
+          final mine = _myOrders.any((m) => m.id == o.id);
+          if (mine) return true;
+          if (s == 'awaiting' || s == 'confirmed' || s == 'new') return true;
+          if (s == 'delivered' || s == 'completed') return true;
+          return false;
+        }).toList();
         orders
           ..clear()
           ..addAll(combined);
         if (combined.isEmpty) {
           ordersError = 'No orders found';
         }
+        _lastOrdersStatus
+          ..clear()
+          ..addEntries(combined.map((o) => MapEntry(o.id, o.status)));
       });
+      // Decide if there are new or updated orders and play a tone
+      final changed = orders.any((o) => (prev[o.id] != o.status));
+      final added = orders.any((o) => !prev.containsKey(o.id));
+      if ((changed || added) && notificationsEnabled) {
+        await _playNewOrderTone(durationSeconds: 4);
+        for (final o in orders) {
+          if (!prev.containsKey(o.id)) {
+            final food = (o.foodType ?? '')
+                .replaceAll(RegExp(r"<[^>]*>"), '')
+                .trim();
+            final name = o.customerName
+                .replaceAll(RegExp(r"<[^>]*>"), '')
+                .trim();
+            final pickup = o.pickupAddress.replaceAll(RegExp(r"<[^>]*>"), '');
+            final drop = o.deliveryAddress.replaceAll(RegExp(r"<[^>]*>"), '');
+            double? pay;
+            if (o.payout > 0) {
+              pay = o.payout;
+            } else if (o.distanceKm != null) {
+              pay = o.distanceKm! * _ratePerKm;
+            }
+            final price = pay != null ? ('R ' + pay.toStringAsFixed(2)) : 'R -';
+            final title = food.isNotEmpty ? food : 'New order';
+            final body =
+                (name.isNotEmpty ? name : '-') +
+                '\nPickup: ' +
+                pickup +
+                '\nDropoff: ' +
+                drop +
+                '\nPrice: ' +
+                price;
+            await Notifications.showNewOrder(o.id, title, body);
+          }
+        }
+      }
     } catch (_) {
       _safeSetState(() {
         ordersError = 'Network error';
@@ -84,6 +146,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _safeSetState(() {
         loadingOrders = false;
       });
+    }
+  }
+
+  Future<void> _initTts() async {
+    try {
+      _tts = FlutterTts();
+      await _tts!.setLanguage('en-US');
+      await _tts!.setPitch(1.0);
+      await _tts!.setSpeechRate(0.5);
+    } catch (_) {}
+  }
+
+  Future<void> _playNewOrderTone({int durationSeconds = 4}) async {
+    if (_tts == null || !notificationsEnabled) return;
+    final end = DateTime.now().add(Duration(seconds: durationSeconds));
+    while (DateTime.now().isBefore(end)) {
+      if (!notificationsEnabled) break;
+      try {
+        await _tts!.speak('ding');
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 900));
     }
   }
 
@@ -125,6 +208,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
           dealerLat: o.dealerLat,
           dealerLng: o.dealerLng,
           distanceKm: d,
+          foodType: o.foodType,
+          createdAt: o.createdAt,
+          customerPhone: o.customerPhone,
         );
       }
       return o;
@@ -141,13 +227,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _startPolling();
     _startStatsPolling();
     _startPositionStream();
+    _initTts();
   }
 
   double get earningsToday => orders
-      .where((o) => o.status == 'delivered')
+      .where(
+        (o) =>
+            o.status.toLowerCase() == 'delivered' ||
+            o.status.toLowerCase() == 'completed',
+      )
       .fold(0.0, (sum, o) => sum + o.payout);
 
-  int get deliveredCount => orders.where((o) => o.status == 'delivered').length;
+  int get deliveredCount => orders
+      .where(
+        (o) =>
+            o.status.toLowerCase() == 'delivered' ||
+            o.status.toLowerCase() == 'completed',
+      )
+      .length;
 
   List<Order> get filteredOrders {
     switch (filter) {
@@ -160,16 +257,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
             : orders.where((o) => o.status != 'delivered').toList();
       case 'delivered':
         final mineDelivered = _myOrders
-            .where((o) => o.status == 'delivered')
+            .where(
+              (o) =>
+                  o.status.toLowerCase() == 'delivered' ||
+                  o.status.toLowerCase() == 'completed',
+            )
             .toList();
         return mineDelivered.isNotEmpty
             ? mineDelivered
-            : orders.where((o) => o.status == 'delivered').toList();
+            : orders
+                  .where(
+                    (o) =>
+                        o.status.toLowerCase() == 'delivered' ||
+                        o.status.toLowerCase() == 'completed',
+                  )
+                  .toList();
       case 'nearby':
         final n = orders.where((o) => (o.distanceKm ?? 999) <= 8.0).toList();
         return n.isNotEmpty ? n : orders;
       default:
-        return orders;
+        final cutoff = DateTime.now().subtract(const Duration(hours: 2));
+        return orders.where((o) {
+          if (o.createdAt == null) return true;
+          final isIncoming =
+              o.status.toLowerCase() == 'awaiting' ||
+              o.status.toLowerCase() == 'confirmed' ||
+              o.status.toLowerCase() == 'new';
+          if (!isIncoming && o.createdAt!.isBefore(cutoff)) return false;
+          return true;
+        }).toList();
     }
   }
 
@@ -419,6 +535,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                     color: AppTheme.bloodRed,
                                   ),
                                 ),
+                                const SizedBox(height: 6),
+                                Builder(
+                                  builder: (context) {
+                                    final dt = DriverSession.lastDeliveredAt;
+                                    if (dt == null)
+                                      return const SizedBox.shrink();
+                                    final t = TimeOfDay.fromDateTime(
+                                      dt,
+                                    ).format(context);
+                                    return Text(
+                                      'Last: $t',
+                                      style: const TextStyle(
+                                        color: Colors.black54,
+                                      ),
+                                    );
+                                  },
+                                ),
                               ],
                             ),
                           ),
@@ -555,15 +688,97 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
-                              _StatusChip(status: order.status),
+                              Row(
+                                children: [
+                                  _StatusChip(status: order.status),
+                                  if (order.status.toLowerCase() == 'new' ||
+                                      ((order.createdAt != null) &&
+                                          (DateTime.now()
+                                                  .difference(order.createdAt!)
+                                                  .inHours <
+                                              2) &&
+                                          (order.status.toLowerCase() ==
+                                                  'awaiting' ||
+                                              order.status.toLowerCase() ==
+                                                  'confirmed' ||
+                                              order.status.toLowerCase() ==
+                                                  'new')))
+                                    Container(
+                                      margin: const EdgeInsets.only(left: 8),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 4,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: AppTheme.bloodRed.withOpacity(
+                                          0.12,
+                                        ),
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(
+                                          color: AppTheme.bloodRed,
+                                        ),
+                                      ),
+                                      child: const Text(
+                                        'NEW',
+                                        style: TextStyle(
+                                          color: AppTheme.bloodRed,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                  if ((order.createdAt != null) &&
+                                      (DateTime.now()
+                                              .difference(order.createdAt!)
+                                              .inHours >=
+                                          2) &&
+                                      !(order.status.toLowerCase() == 'new'))
+                                    Container(
+                                      margin: const EdgeInsets.only(left: 8),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 4,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.grey.withOpacity(0.15),
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(color: Colors.grey),
+                                      ),
+                                      child: const Text(
+                                        'OLD',
+                                        style: TextStyle(
+                                          color: Colors.grey,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                  const SizedBox(width: 8),
+                                ],
+                              ),
                             ],
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            order.customerName.replaceAll(
-                              RegExp(r"<[^>]*>"),
-                              '',
-                            ),
+                            (((order.foodType ?? '').replaceAll(
+                                  RegExp(r"<[^>]*>"),
+                                  '',
+                                )).trim().isNotEmpty
+                                ? (order.foodType ?? '').replaceAll(
+                                    RegExp(r"<[^>]*>"),
+                                    '',
+                                  )
+                                : (order.customerName.replaceAll(
+                                    RegExp(r"<[^>]*>"),
+                                    '',
+                                  )).trim().isNotEmpty
+                                ? order.customerName.replaceAll(
+                                    RegExp(r"<[^>]*>"),
+                                    '',
+                                  )
+                                : order.deliveryAddress.replaceAll(
+                                    RegExp(r"<[^>]*>"),
+                                    '',
+                                  )),
+                            style: const TextStyle(fontWeight: FontWeight.w600),
                           ),
                           const SizedBox(height: 4),
                           Text(
@@ -593,9 +808,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                       ),
                                       onPressed: () async {
                                         final dist = order.distanceKm;
-                                        final pay = dist != null
-                                            ? dist * _ratePerKm
-                                            : null;
+                                        final pay = (order.payout > 0)
+                                            ? order.payout
+                                            : (dist != null
+                                                  ? dist * _ratePerKm
+                                                  : null);
                                         final okConfirm =
                                             await showDialog<bool>(
                                               context: context,
@@ -713,30 +930,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                           widget.onSelectOrder!(order);
                                           widget.goToNavigate?.call();
                                         } else {
-                                          final usedExternal =
-                                              DriverSession.mapboxToken.isEmpty
-                                              ? await _openExternalDirections(
-                                                  order,
-                                                )
-                                              : false;
-                                          if (!usedExternal) {
-                                            await Navigator.pushNamed(
-                                              context,
-                                              '/navigate',
-                                              arguments: {
-                                                'order': order,
-                                                'autoStart': true,
-                                              },
-                                            );
-                                            await fetchOrders();
-                                            await fetchDashboardStats();
-                                          } else {
-                                            await Future.delayed(
-                                              const Duration(seconds: 2),
-                                            );
-                                            await fetchOrders();
-                                            await fetchDashboardStats();
-                                          }
+                                          await Navigator.pushNamed(
+                                            context,
+                                            '/navigate',
+                                            arguments: {
+                                              'order': order,
+                                              'autoStart': true,
+                                            },
+                                          );
+                                          await fetchOrders();
+                                          await fetchDashboardStats();
                                         }
                                         try {
                                           final okStatus =
@@ -839,9 +1042,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   Builder(
                                     builder: (_) {
                                       final d = order.distanceKm;
-                                      if (d == null)
+                                      final pay = (order.payout > 0)
+                                          ? order.payout
+                                          : (d != null ? d * _ratePerKm : null);
+                                      if (pay == null)
                                         return const SizedBox.shrink();
-                                      final pay = d * _ratePerKm;
                                       return Container(
                                         padding: const EdgeInsets.symmetric(
                                           horizontal: 10,
@@ -898,15 +1103,19 @@ class _StatusChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     Color bg;
+    String label = status;
     switch (status) {
       case 'awaiting':
         bg = AppTheme.bloodRed.withOpacity(0.3);
+        label = 'incoming';
         break;
       case 'in_progress':
         bg = AppTheme.bloodRed.withOpacity(0.6);
+        label = 'in progress';
         break;
       case 'delivered':
         bg = Colors.green.withOpacity(0.3);
+        label = 'delivered';
         break;
       default:
         bg = Colors.grey.withOpacity(0.3);
@@ -917,7 +1126,7 @@ class _StatusChip extends StatelessWidget {
         color: bg,
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Text(status),
+      child: Text(label),
     );
   }
 }

@@ -175,11 +175,9 @@ class _EarningsScreenState extends State<EarningsScreen> {
                                                   updating.add(item.id);
                                                 });
                                                 final ok =
-                                                    await ApiClient.updateOrderStatus(
-                                                      item.id,
-                                                      'delivered',
-                                                      action: 'update_status',
-                                                    );
+                                                    await ApiClient.markDelivered(
+                                                  item.id,
+                                                );
                                                 if (ok) {
                                                   await fetchEarnings();
                                                   ScaffoldMessenger.of(

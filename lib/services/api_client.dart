@@ -291,6 +291,27 @@ class ApiClient {
             final phone =
                 (e['delivery_phone'] ?? e['customer_phone'] ?? e['phone'] ?? '')
                     .toString();
+            final food = _s(
+              ((e['food_title'] ??
+                      e['food_type'] ??
+                      e['category'] ??
+                      e['order_type'] ??
+                      e['items_summary'] ??
+                      '')
+                  .toString()),
+            );
+            DateTime? created;
+            final dstr =
+                (e['order_date'] ??
+                        e['created_at'] ??
+                        e['order_date_formatted'] ??
+                        '')
+                    .toString();
+            if (dstr.isNotEmpty) {
+              try {
+                created = DateTime.tryParse(dstr);
+              } catch (_) {}
+            }
             return Order(
               id: _s(e['order_id']?.toString()),
               customerName: _s(
@@ -305,6 +326,8 @@ class ApiClient {
               payout: payoutNum,
               dealerLat: lat,
               dealerLng: lng,
+              foodType: food.isNotEmpty ? food : null,
+              createdAt: created,
             );
           }).toList();
         }
@@ -495,6 +518,15 @@ class ApiClient {
             final phone =
                 (e['delivery_phone'] ?? e['customer_phone'] ?? e['phone'] ?? '')
                     .toString();
+            final food = _s(
+              ((e['food_title'] ??
+                      e['food_type'] ??
+                      e['category'] ??
+                      e['order_type'] ??
+                      e['items_summary'] ??
+                      '')
+                  .toString()),
+            );
             return Order(
               id: _s(e['order_id']?.toString()),
               customerName: _s(
@@ -505,6 +537,7 @@ class ApiClient {
               deliveryAddress: _s((e['delivery_address'] ?? '').toString()),
               status: _s((e['status'] ?? 'confirmed').toString()),
               payout: payoutNum,
+              foodType: food.isNotEmpty ? food : null,
             );
           }).toList();
         }
@@ -621,9 +654,16 @@ class ApiClient {
     if (res != null && res.statusCode == 200) {
       try {
         final data = jsonDecode(res.body);
-        return data is Map &&
+        final ok =
+            data is Map &&
             (data['success'] == true || data['status'] == 'success');
-      } catch (_) {}
+        if (!ok && data is Map) {
+          lastError = (data['message'] ?? data['error'] ?? '').toString();
+        }
+        return ok;
+      } catch (e) {
+        lastError = e.toString();
+      }
     }
     if (res != null) {
       final snippet = res.body.substring(
@@ -633,6 +673,293 @@ class ApiClient {
       lastError = 'HTTP ${res.statusCode}: $snippet';
     }
     return false;
+  }
+
+  static Future<bool> _postStatusToDriverOrders(
+    String orderId,
+    String status, {
+    String? action,
+    Map<String, dynamic>? extra,
+  }) async {
+    final driverId = await resolveDriverId();
+    final uri = Uri.parse(
+      ApiEndpoints.driverOrders,
+    ).replace(queryParameters: {'action': action ?? 'update_status'});
+    final headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
+      if ((DriverSession.authToken ?? '').isNotEmpty)
+        'Authorization': 'Bearer ' + (DriverSession.authToken ?? ''),
+    };
+    final body = <String, String>{
+      'order_id': orderId,
+      'status': status,
+      'action': action ?? 'update_status',
+      if (currentUser?.userId != null)
+        'user_id': currentUser!.userId.toString(),
+      if (currentUser?.username.isNotEmpty == true)
+        'driver': currentUser!.username,
+      if (driverId != null) 'driver_id': driverId.toString(),
+      'is_driver': '1',
+      if ((DriverSession.authToken ?? '').isNotEmpty)
+        'token': (DriverSession.authToken ?? ''),
+      if ((DriverSession.authToken ?? '').isNotEmpty)
+        'session_token': (DriverSession.authToken ?? ''),
+      if (extra != null) ...extra.map((k, v) => MapEntry(k, v.toString())),
+    };
+    http.Response? res;
+    try {
+      res = await http
+          .post(uri, headers: headers, body: body)
+          .timeout(const Duration(seconds: 12));
+    } catch (e) {
+      lastError = e.toString();
+    }
+    if (res != null && res.statusCode == 200) {
+      try {
+        final data = jsonDecode(res.body);
+        final ok =
+            data is Map &&
+            (data['success'] == true || data['status'] == 'success');
+        if (!ok && data is Map) {
+          lastError = (data['message'] ?? data['error'] ?? '').toString();
+        }
+        return ok;
+      } catch (e) {
+        lastError = e.toString();
+      }
+    }
+    if (res != null) {
+      final snippet = res.body.substring(
+        0,
+        res.body.length > 240 ? 240 : res.body.length,
+      );
+      lastError = 'HTTP ${res.statusCode}: $snippet';
+    }
+    return false;
+  }
+
+  static Future<bool> markDelivered(String orderId, {double? fee}) async {
+    final ts = nowTs();
+    final dId = await resolveDriverId();
+    final extra = <String, dynamic>{
+      'driver_delivered_time': ts,
+      'driver_delivery_time': ts,
+      'delivered_at': ts,
+      if (fee != null) 'delivery_fee': fee,
+      if (fee != null) 'fee': fee,
+      if (dId != null) 'driver_id': dId,
+      if (currentUser?.userId != null) 'user_id': currentUser!.userId!,
+      if (currentUser?.username.isNotEmpty == true)
+        'driver': currentUser!.username,
+    };
+    bool ok = await updateOrderStatus(
+      orderId,
+      'delivered',
+      action: 'update_status',
+      extra: extra,
+    );
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'delivered',
+        action: 'deliver',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'delivered',
+        action: 'deliver',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'delivered',
+        action: 'update_status',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'completed',
+        action: 'update_status',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'completed',
+        action: 'complete',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'completed',
+        action: 'update_status',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'completed',
+        action: 'complete',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (ok) {
+      try {
+        DriverSession.lastDeliveredAt = DateTime.now();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  static Future<bool> markDeliveredOrdersPhp(
+    String orderId, {
+    double? fee,
+  }) async {
+    final ts = nowTs();
+    final dId = await resolveDriverId();
+    final extra = <String, dynamic>{
+      'driver_delivered_time': ts,
+      'driver_delivery_time': ts,
+      'delivered_at': ts,
+      if (fee != null) 'delivery_fee': fee,
+      if (fee != null) 'fee': fee,
+      if (dId != null) 'driver_id': dId,
+      if (currentUser?.userId != null) 'user_id': currentUser!.userId!,
+      if (currentUser?.username.isNotEmpty == true)
+        'driver': currentUser!.username,
+    };
+    bool ok = await updateOrderStatus(
+      orderId,
+      'delivered',
+      action: 'deliver',
+      extra: extra,
+    );
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'delivered',
+        action: 'update_status',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'completed',
+        action: 'complete',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'completed',
+        action: 'update_status',
+        extra: {...extra, 'driver_completed_time': ts, 'completed_at': ts},
+      );
+    }
+    if (ok) {
+      try {
+        DriverSession.lastDeliveredAt = DateTime.now();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  static Future<bool> cancelOrder(String orderId) async {
+    final ts = nowTs();
+    final dId = await resolveDriverId();
+    final extra = <String, dynamic>{
+      'driver_canceled_time': ts,
+      'canceled_at': ts,
+      if (dId != null) 'driver_id': dId,
+      if (currentUser?.userId != null) 'user_id': currentUser!.userId!,
+      if (currentUser?.username.isNotEmpty == true)
+        'driver': currentUser!.username,
+    };
+    bool ok = await updateOrderStatus(
+      orderId,
+      'awaiting',
+      action: 'update_status',
+      extra: extra,
+    );
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'awaiting',
+        action: 'cancel',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'awaiting',
+        action: 'reject',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'awaiting',
+        action: 'update_status',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'awaiting',
+        action: 'cancel',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'cancelled',
+        action: 'update_status',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await updateOrderStatus(
+        orderId,
+        'cancelled',
+        action: 'cancel',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'cancelled',
+        action: 'update_status',
+        extra: extra,
+      );
+    }
+    if (!ok) {
+      ok = await _postStatusToDriverOrders(
+        orderId,
+        'cancelled',
+        action: 'cancel',
+        extra: extra,
+      );
+    }
+    return ok;
   }
 
   static Future<bool> openOrdersPage() async {
@@ -847,6 +1174,26 @@ class ApiClient {
                       details['phone'] ??
                       '')
                   .toString();
+          final food = _s(
+            ((details['food_type'] ??
+                    details['category'] ??
+                    details['order_type'] ??
+                    details['items_summary'] ??
+                    '')
+                .toString()),
+          );
+          DateTime? created;
+          final dstr =
+              (details['order_date'] ??
+                      details['created_at'] ??
+                      e['created_at'] ??
+                      '')
+                  .toString();
+          if (dstr.isNotEmpty) {
+            try {
+              created = DateTime.tryParse(dstr);
+            } catch (_) {}
+          }
           return Order(
             id: _s((e['order_id'] ?? '').toString()),
             customerName: _s(
@@ -857,6 +1204,8 @@ class ApiClient {
             deliveryAddress: _s((details['delivery_address'] ?? '').toString()),
             status: _s((details['status'] ?? 'awaiting').toString()),
             payout: payoutNum,
+            foodType: food.isNotEmpty ? food : null,
+            createdAt: created,
           );
         }).toList();
       }
